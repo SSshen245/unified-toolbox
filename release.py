@@ -368,14 +368,24 @@ def main():
     # run()/git() 返回的是 (returncode, stdout)，这里要的是 stdout
     _, existing_tags = git("tag", "-l", tag)
     if existing_tags.strip():
-        # 同一个版本号重复发版：加时间戳，避免覆盖已有 tag
-        tag = f"{version}-build.{time.strftime('%Y%m%d-%H%M')}"
-        say(f"      注意：tag {version} 已存在，本次改用 {tag}")
-        say(f"      建议：把 unified.py 里的 APP_VERSION 递增为 {next_version(version)} 再发版。")
-        say("            在线更新的版本比较依赖这个号——重复发同一个号，")
-        say("            老用户点「检查更新」会一直提示「已是最新版本」，收不到新包。")
-    git("tag", "-a", tag, "-m", f"发版 {tag}")
-    say(f"[3/6] 已打 tag：{tag}")
+        # 本地已有这个 tag：先看远端有没有。
+        # 没有 = 上次发布推到一半断了（tag 打了、没推上去）→ 直接复用这个 tag 接着发；
+        # 有   = 这个版本真的发布过 → 另起 build tag，别覆盖。
+        remote_tag = subprocess.run(["git", "ls-remote", "--tags", "origin", tag],
+                                    capture_output=True, text=True,
+                                    timeout=60).stdout.strip()
+        if remote_tag:
+            tag = f"{version}-build.{time.strftime('%Y%m%d-%H%M')}"
+            say(f"      注意：tag {version} 已存在（远端已发布过），本次改用 {tag}")
+            say(f"      建议：把 unified.py 里的 APP_VERSION 递增为 {next_version(version)} 再发版。")
+            say("            在线更新的版本比较依赖这个号——重复发同一个号，")
+            say("            老用户点「检查更新」会一直提示「已是最新版本」，收不到新包。")
+            git("tag", "-a", tag, "-m", f"发版 {tag}")
+        else:
+            say(f"      tag {tag} 本地已有、远端还没有 —— 接着把上次没推完的发布推完")
+    else:
+        git("tag", "-a", tag, "-m", f"发版 {tag}")
+    say(f"[3/6] tag 就绪：{tag}")
 
     if "--no-build" in flags:
         say("[4/6] 跳过打包（--no-build）")
