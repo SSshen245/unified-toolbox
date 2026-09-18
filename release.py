@@ -147,8 +147,9 @@ def main():
 
     # ── 3. 打 tag ──
     tag = version
-    exists, _ = git("tag", "-l", tag)
-    if exists.strip():
+    # run()/git() 返回的是 (returncode, stdout)，这里要的是 stdout
+    _, existing_tags = git("tag", "-l", tag)
+    if existing_tags.strip():
         # 同一个版本号重复发版：加时间戳，避免覆盖已有 tag
         tag = f"{version}-build.{time.strftime('%Y%m%d-%H%M')}"
         say(f"      提示：tag {version} 已存在（建议在 unified.py 里递增 APP_VERSION）")
