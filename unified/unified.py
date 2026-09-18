@@ -200,6 +200,7 @@ UPDATE_REPO_DEFAULT = "SSshen245/unified-toolbox"
 # "'latin-1' codec can't encode characters"）。用纯 ASCII 的 UA。
 _UPDATE_UA = {"User-Agent": "UnifiedToolbox-UpdateCheck",
               "Accept": "application/vnd.github+json"}
+_CHECK_CACHE = {"repo": None, "at": 0.0, "result": None}   # 查询结果缓存（10 分钟）
 
 
 def version_key(v):
@@ -208,15 +209,17 @@ def version_key(v):
     return tuple(int(x) for x in parts[:4]) or (0,)
 
 
-def fetch_latest_release(repo, timeout=15):
+def fetch_latest_release(repo, timeout=15, use_cache=True):
     """查最新 Release，返回 (tag, 下载直链, 文件名, 错误串)。
 
-    更新源两种写法：
-      owner/repo          -> GitHub（api.github.com）
-      gitee:owner/repo    -> Gitee（gitee.com/api/v5，国内可直连）
-
-    只用标准库 urllib，不引入新依赖（本项目的 exe 才 18MB，不值得为此加包）。
+    成功结果缓存 10 分钟：匿名接口每 IP 每小时只有 60 次，重复点按钮
+    不该重复消耗额度。
     """
+    global _CHECK_CACHE
+    repo = (repo or "").strip().strip("/")
+    now = time.time()
+    if use_cache and _CHECK_CACHE["repo"] == repo and now - _CHECK_CACHE["at"] < 600:
+        return _CHECK_CACHE["result"]
     spec_ = (repo or "").strip().strip("/")
     if not spec_:
         return None, None, None, "未配置更新源（需要填 owner/repo）"
@@ -244,7 +247,13 @@ def fetch_latest_release(repo, timeout=15):
         if e.code == 404:
             return None, None, None, who + " 上找不到仓库，或该仓库还没有发布 Release"
         if e.code == 403:
-            return None, None, None, who + " 接口限流，请稍后再试"
+            # 匿名接口每 IP 每小时 60 次；把恢复时间一并告诉用户
+            reset = e.headers.get("X-RateLimit-Reset") if e.headers else None
+            when = ""
+            if reset and str(reset).isdigit():
+                when = "，%s 自动恢复" % time.strftime("%H:%M", time.localtime(int(reset)))
+            return None, None, None, ("GitHub 匿名接口达到限额（每 IP 每小时 60 次）%s；"
+                                      "也可把更新源换成 gitee:owner/repo" % when)
         return None, None, None, who + " 返回 HTTP %s" % e.code
     except Exception as e:
         return None, None, None, "网络错误（%s）：%s" % (who, e)
@@ -263,7 +272,9 @@ def fetch_latest_release(repo, timeout=15):
     url = pick.get("browser_download_url")
     if use_api_asset:
         url = pick.get("url") or url
-    return tag, url, pick.get("name"), None
+    result = (tag, url, pick.get("name"), None)
+    _CHECK_CACHE.update(repo=spec_, at=time.time(), result=result)
+    return result
 
 
 def download_update(url, dest, progress=None, timeout=300):
