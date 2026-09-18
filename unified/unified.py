@@ -10352,7 +10352,9 @@ class App:
         # 点 X 等同「取消」：否则预览中的主题会残留，且 _settings_theme_at_open 不会清掉
         win.protocol("WM_DELETE_WINDOW", cancel)
 
-        # ── 尺寸：内容多高就开多高，屏幕装不下才靠滚动条（并允许用户拉伸） ──
+        # ── 尺寸：开成"普通窗口"，不再贴着屏幕高度 ──
+        # 内容比窗口高时交给 _ScrollArea 的滚动条（保存/取消已固定在底部，始终可见）；
+        # 想一次看全的用户直接把窗口拉大即可（可拉伸，宽度下限取内容自然宽度）。
         win.update_idletasks()
         try:
             form_w = form.winfo_reqwidth()
@@ -10360,8 +10362,10 @@ class App:
             bar_h = btns.winfo_reqheight() + 24
             avail_w = max(380, win.winfo_screenwidth() - 80)
             avail_h = max(320, win.winfo_screenheight() - 140)
+            # 常规窗口高度：约屏幕的 2/3，至少给 520，最多不超过屏幕可用高度
+            normal_h = min(avail_h, max(520, int(win.winfo_screenheight() * 0.66)))
             width = max(470, min(form_w + 46, avail_w))
-            height = min(form_h + bar_h, avail_h)
+            height = min(form_h + bar_h, normal_h)
         except Exception:
             width, height = 470, 680
         win.resizable(True, True)
