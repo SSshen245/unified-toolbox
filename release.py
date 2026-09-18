@@ -163,10 +163,22 @@ def main():
         return
 
     # ── 4. 打包 exe ──
-    say("[4/5] PyInstaller 打包中（约 25~35 秒）…")
-    run([sys.executable, "-m", "PyInstaller", "统一工具箱.spec",
-         "--noconfirm", "--distpath", "dist", "--workpath", "build"],
-        capture=False)
+    say("[4/5] PyInstaller 打包中（约 25~35 秒，请稍候）…")
+    # --log-level WARN：默认 INFO 会刷满整屏，双击运行时更该只看到关键信息
+    r = subprocess.run([sys.executable, "-m", "PyInstaller", "统一工具箱.spec",
+                        "--noconfirm", "--distpath", "dist", "--workpath", "build",
+                        "--log-level", "WARN"],
+                       capture_output=True, text=True,
+                       encoding="utf-8", errors="replace")
+    if r.returncode != 0:
+        say("[失败] 打包失败：")
+        for stream in (r.stdout, r.stderr):
+            if stream and stream.strip():
+                say(stream.strip()[-2000:])
+        raise SystemExit(1)
+    noise = [l for l in ((r.stdout or "") + (r.stderr or "")).splitlines() if l.strip()]
+    for line in noise[-5:]:
+        say("      " + line)
     exe = ROOT / "dist" / "统一工具箱.exe"
     if not exe.exists():
         say("[失败] 打包结束但没找到 dist\\统一工具箱.exe")

@@ -48,10 +48,21 @@ Ctrl+Alt+T     窗口置顶开关
 · 残留扫描只处理能验证归属的安装目录；不确定的注册表键一律不删。
 · 激活模块为只读检测；安装密钥操作需 UAC 管理员确认，仅限自有授权。
 
-【重新打包（开发者）】
-1. 双击 打包.cmd（或手动执行）：
+【日常开发】
+改完代码直接跑源码，不需要打包，改动立即生效：
+   venv\Scripts\python.exe unified\unified.py
+
+【发版 / 打包（开发者）】
+推荐双击 发版.cmd，一键完成下列全部步骤：
+1. 跑单元测试（不通过就中止，不会打出坏包）
+2. 自动提交当前改动并打 tag（tag 取自 unified.py 的 APP_VERSION）
+3. PyInstaller 打包        -> dist\统一工具箱.exe
+4. 生成交付包              -> dist\统一工具箱-源码.zip（给开发者，不含 .git）
+                              dist\统一工具箱.bundle（给开发者，含完整 git 历史）
+发版前建议先递增 unified\unified.py 里的 APP_VERSION（当前 v3.7）。
+
+也可手动单步执行：
    venv\Scripts\python.exe -m PyInstaller 统一工具箱.spec
-2. 产物：dist\统一工具箱.exe
-3. 运行测试：venv\Scripts\python.exe -m unittest discover -s tests -v
+   venv\Scripts\python.exe -m unittest discover -s tests -v
 
 版本 v3.7 · Python 3.11 · Tkinter
