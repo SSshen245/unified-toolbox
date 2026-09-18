@@ -199,7 +199,7 @@ UPDATE_REPO_DEFAULT = "SSshen245/unified-toolbox"
 # GitHub 被限流/连不上时的自动备用源（通常是在 Gitee 导入的同名仓库）。
 # 前提：Gitee 上要有同名仓库，且 Release 里传了同名附件；fork 的人改成
 # 自己的镜像，留空 = 关闭兜底。没配镜像时兜底会静默失败，不影响主流程。
-UPDATE_REPO_FALLBACK = "gitee:SSshen245/unified-toolbox"
+UPDATE_REPO_FALLBACK = "gitee:szsz/unified-toolbox"
 
 # HTTP 头必须是 latin-1：这里**不能**用 APP_NAME（中文会让 urllib 直接抛
 # "'latin-1' codec can't encode characters"）。用纯 ASCII 的 UA。
@@ -295,6 +295,10 @@ def fetch_latest_release(repo, timeout=15, use_cache=True):
         fb = _fetch_release_once(UPDATE_REPO_FALLBACK, timeout)
         if fb[0]:
             result = fb
+        elif fb[3] and fb[3] != err:
+            # 两边都没成功：把备用源失败的原因也亮出来，方便发现
+            # "镜像没建 Release / 没传附件" 这类问题
+            result = (None, None, None, err + "；备用源也不可用（%s）" % fb[3])
     if result[3] is None:
         _CHECK_CACHE.update(repo=repo, at=now, result=result)
     return result

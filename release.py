@@ -96,6 +96,97 @@ def next_version(v):
 GH_ASSET_NAME = "UnifiedToolbox.exe"
 
 
+def _gitee_slug():
+    """从 unified.py 里读 UPDATE_REPO_FALLBACK 的 gitee:owner/repo。"""
+    src = (ROOT / "unified" / "unified.py").read_text(encoding="utf-8")
+    m = re.search(r'UPDATE_REPO_FALLBACK\s*=\s*"gitee:([^"]+)"', src)
+    return m.group(1) if m else ""
+
+
+def _gitee_token():
+    """Gitee 私人令牌：优先环境变量 GITEE_TOKEN，其次项目根目录 gitee_token.txt。"""
+    t = os.environ.get("GITEE_TOKEN", "").strip()
+    if not t:
+        f = ROOT / "gitee_token.txt"
+        if f.exists():
+            t = f.read_text(encoding="utf-8").strip()
+    return t
+
+
+def publish_to_gitee(tag, exe, say):
+    """把 exe 同步发布到 Gitee（国内兜底更新源的数据来源）。
+
+    需要一次性准备：Gitee → 设置 → 私人令牌（勾 projects 权限），
+    把令牌放进环境变量 GITEE_TOKEN 或项目根目录 gitee_token.txt。
+    没准备就明确跳过，不影响 GitHub 发布。
+    """
+    import json as _json
+    import urllib.parse as _up
+    import urllib.request as _uq
+
+    token = _gitee_token()
+    slug = _gitee_slug()
+    if not (token and slug):
+        say("      Gitee 兜底源：跳过（未设置 GITEE_TOKEN 或未配置 UPDATE_REPO_FALLBACK）")
+        return False
+
+    api = f"https://gitee.com/api/v5/repos/{slug}"
+
+    def call(path, data=None, file_path=None, method="GET"):
+        url = f"{api}{path}"
+        body, headers = None, {}
+        if file_path:
+            boundary = "----utbForm7d1a2f9c"
+            pre = (f"--{boundary}\r\n"
+                   f'Content-Disposition: form-data; name="access_token"\r\n\r\n'
+                   f"{token}\r\n").encode()
+            mid = (f"--{boundary}\r\n"
+                   f'Content-Disposition: form-data; name="file"; '
+                   f'filename="{GH_ASSET_NAME}"\r\n'
+                   f"Content-Type: application/octet-stream\r\n\r\n").encode()
+            body = pre + mid + Path(file_path).read_bytes() + \
+                f"\r\n--{boundary}--\r\n".encode()
+            headers["Content-Type"] = f"multipart/form-data; boundary={boundary}"
+        else:
+            data = dict(data or {})
+            data["access_token"] = token
+            body = _up.urlencode(data).encode()
+            headers["Content-Type"] = "application/x-www-form-urlencoded"
+        req = _uq.Request(url, data=body, headers=headers, method=method)
+        with _uq.urlopen(req, timeout=300) as resp:
+            return _json.loads(resp.read().decode("utf-8"))
+
+    try:
+        # 附件名固定为 ASCII 的 UnifiedToolbox.exe（应用按 .exe 后缀挑附件）
+        ascii_exe = exe.with_name(GH_ASSET_NAME)
+        made_copy = not ascii_exe.exists()
+        if made_copy:
+            shutil.copy2(exe, ascii_exe)
+        try:
+            rel = None
+            try:
+                rel = call(f"/releases/tags/{tag}")
+            except Exception:
+                rel = None
+            if not rel:
+                rel = call("/releases", method="POST", data={
+                    "tag_name": tag,
+                    "name": f"统一工具箱 {tag}",
+                    "body": f"同步自 GitHub Release {tag}。更新说明见同名 GitHub Release。",
+                })
+                say(f"      Gitee：已创建发行版 {tag}")
+            rel_id = rel["id"]
+            call(f"/releases/{rel_id}/attach_files", file_path=ascii_exe, method="POST")
+            say(f"      Gitee：附件已上传 → https://gitee.com/{slug}/releases/tag/{tag}")
+            return True
+        finally:
+            if made_copy:
+                ascii_exe.unlink(missing_ok=True)
+    except Exception as e:
+        say(f"      Gitee 同步失败（不影响 GitHub 发布）:{e}")
+        return False
+
+
 def find_gh():
     """找 gh CLI：先看 PATH，再看本机便携安装位置。"""
     for cand in ("gh", "gh.exe"):
@@ -442,6 +533,8 @@ def main():
     else:
         say("[6/6] 发布到 GitHub Release…")
         published = publish_to_github(tag, exe, notes_file, say)
+        if published:
+            publish_to_gitee(tag, exe, say)
 
     say()
     say("=" * 64)
