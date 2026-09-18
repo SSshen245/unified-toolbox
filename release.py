@@ -140,6 +140,18 @@ def publish_to_github(tag, exe, notes_path, say):
         say("      跳过：origin 不是 GitHub 仓库")
         return False
 
+    # 先把代码推上去，否则 gh release create --target main 会把 tag 打在
+    # 远端的旧提交上，发布的 exe 和仓库代码对不上。
+    say("      推送代码到 GitHub…")
+    try:
+        git("push", "origin", "main")
+        git("push", "origin", tag)
+    except Exception as e:
+        say(f"      发布中止：推送失败（{e}）")
+        say("      网络通后再跑一次即可；代码没推上去不能发 Release，")
+        say("      否则 --target main 会把 tag 打在远端旧提交上，exe 与源码对不上。")
+        return False
+
     # 用 ASCII 名的副本上传（本地文件名保持中文不动）
     ascii_exe = exe.with_name(GH_ASSET_NAME)
     try:
