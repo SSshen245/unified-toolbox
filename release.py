@@ -145,7 +145,12 @@ def publish_to_github(tag, exe, notes_path, say):
     say("      推送代码到 GitHub…")
     try:
         git("push", "origin", "main")
-        git("push", "origin", tag)
+        existing = subprocess.run(["git", "ls-remote", "--tags", "origin", tag],
+                                  capture_output=True, text=True).stdout.strip()
+        if existing:
+            say(f"      tag {tag} 远端已存在，跳过推送")
+        else:
+            git("push", "origin", tag)
     except Exception as e:
         say(f"      发布中止：推送失败（{e}）")
         say("      网络通后再跑一次即可；代码没推上去不能发 Release，")
