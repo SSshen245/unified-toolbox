@@ -10,7 +10,7 @@ from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
 
 APP_NAME = "统一工具箱"
-APP_VERSION = "v3.10.4"
+APP_VERSION = "v3.10.5"
 
 # 托盘支持（可选依赖：缺失时自动降级为普通窗口行为）
 try:
@@ -6692,6 +6692,8 @@ class UninstallModule(BaseModule):
         btnf = tk.Frame(top, bg=BG)
         btnf.pack(fill="x", padx=16, pady=(6, 12))
         all_apps = []
+        scan_res = {}     # 后台线程写入，主线程 _poll 读取
+        scan_seq = [0]    # 旧扫描迟到时凭 seq 弃用，防旧结果覆盖新扫描
 
         def _refill(*_a):
             kw = kw_var.get().strip().lower()
@@ -6703,32 +6705,45 @@ class UninstallModule(BaseModule):
         kw_var.trace_add("write", _refill)
 
         def _do_scan():
-            try:
-                script = ("Get-AppxPackage | Where-Object { -not $_.IsFramework } | "
-                          "ForEach-Object { $_.DisplayName + \"`t\" + $_.PackageFullName }")
-                si = subprocess.STARTUPINFO()
-                si.dwFlags = subprocess.STARTF_USESHOWWINDOW
-                si.wShowWindow = 0
-                r = subprocess.run(
-                    ["powershell", "-NoProfile", "-EncodedCommand", self._ps_encoded(script)],
-                    capture_output=True, text=True, timeout=45, startupinfo=si,
-                    encoding="utf-8", errors="ignore")
-                apps = self._parse_uwp_lines(r.stdout)
-            except Exception as e:
-                apps = []
-                err = str(e)
-            else:
-                err = ""
-            def _fill():
-                nonlocal all_apps
-                all_apps = apps
-                _refill()
-                if err:
-                    status.config(text=f"枚举失败：{err[:120]}")
+            # 扫描在 daemon 线程跑；结果写 scan_res，由主线程 _poll 回填 UI。
+            # 不能在后台线程调 top.after —— Tk 的 after 非线程安全，
+            # 主循环忙时会抛 "main thread is not in main loop" 且线程静默死亡。
+            scan_seq[0] += 1
+            seq = scan_seq[0]
+            status.config(text="正在枚举 Appx 包…")
+            def work():
+                try:
+                    script = ("Get-AppxPackage | Where-Object { -not $_.IsFramework } | "
+                              "ForEach-Object { $_.DisplayName + \"`t\" + $_.PackageFullName }")
+                    si = subprocess.STARTUPINFO()
+                    si.dwFlags = subprocess.STARTF_USESHOWWINDOW
+                    si.wShowWindow = 0
+                    r = subprocess.run(
+                        ["powershell", "-NoProfile", "-EncodedCommand", self._ps_encoded(script)],
+                        capture_output=True, text=True, timeout=45, startupinfo=si,
+                        encoding="utf-8", errors="ignore")
+                    apps = self._parse_uwp_lines(r.stdout)
+                except Exception as e:
+                    apps = []
+                    err = str(e)
                 else:
-                    status.config(text=f"共 {len(apps)} 个 UWP 应用（未含框架组件）")
-            top.after(0, _fill)
-        threading.Thread(target=_do_scan, daemon=True).start()
+                    err = ""
+                scan_res["apps"], scan_res["err"], scan_res["seq"] = apps, err, seq
+            threading.Thread(target=work, daemon=True).start()
+            def _poll():
+                if not top.winfo_exists():
+                    return                     # 窗口已关，放弃
+                if scan_res.get("seq") != seq:
+                    top.after(200, _poll)      # 未完成或已被新一轮扫描取代
+                    return
+                nonlocal all_apps
+                all_apps = scan_res["apps"]
+                _refill()
+                if scan_res["err"]:
+                    status.config(text=f"枚举失败：{scan_res['err'][:120]}")
+                else:
+                    status.config(text=f"共 {len(all_apps)} 个 UWP 应用（未含框架组件）")
+            top.after(200, _poll)
 
         def _remove_selected():
             sel = tree.selection()
@@ -6748,24 +6763,47 @@ class UninstallModule(BaseModule):
                     f"卸载 {len(targets)} 个 UWP 应用（当前用户）？\n{names}"
                     + ("\n…" if len(targets) > 8 else ""), parent=top, danger=True):
                 return
-            ok = 0
-            for pkg in targets:
+            ok_msg = {"n": 0, "total": len(targets)}
+            # 卸载在 daemon 线程逐个跑（每个最长 120s）；主线程轮询进度。
+            # 原先在主线程 for 循环 subprocess.run：选 N 个包 UI 卡死最长 N×120 秒。
+            q = queue.Queue()
+            btn_remove.config(state="disabled")
+            def work():
+                done = 0
+                for pkg in targets:
+                    try:
+                        script = f"Remove-AppxPackage -Package '{pkg}'"
+                        si = subprocess.STARTUPINFO()
+                        si.dwFlags = subprocess.STARTF_USESHOWWINDOW
+                        si.wShowWindow = 0
+                        subprocess.run(
+                            ["powershell", "-NoProfile", "-EncodedCommand", self._ps_encoded(script)],
+                            capture_output=True, text=True, timeout=120, startupinfo=si,
+                            encoding="utf-8", errors="ignore")
+                        done += 1
+                    except Exception:
+                        pass
+                    q.put(("prog", done))
+                q.put(("done", done))
+            threading.Thread(target=work, daemon=True).start()
+            def _poll():
+                if not top.winfo_exists():
+                    return
                 try:
-                    script = f"Remove-AppxPackage -Package '{pkg}'"
-                    si = subprocess.STARTUPINFO()
-                    si.dwFlags = subprocess.STARTF_USESHOWWINDOW
-                    si.wShowWindow = 0
-                    subprocess.run(
-                        ["powershell", "-NoProfile", "-EncodedCommand", self._ps_encoded(script)],
-                        capture_output=True, text=True, timeout=120, startupinfo=si,
-                        encoding="utf-8", errors="ignore")
-                    ok += 1
-                except Exception:
-                    pass
-            show_info("完成", f"已卸载 {ok}/{len(targets)} 个", parent=top)
-            _do_scan()
+                    kind, val = q.get_nowait()
+                except queue.Empty:
+                    top.after(250, _poll)
+                    return
+                if kind == "prog":
+                    status.config(text=f"正在卸载 {val}/{ok_msg['total']} …")
+                    top.after(250, _poll)
+                    return
+                btn_remove.config(state="normal")
+                show_info("完成", f"已卸载 {val}/{ok_msg['total']} 个", parent=top)
+                _do_scan()
+            top.after(250, _poll)
 
-        self._mkbtn(btnf, "🗑 卸载选中", _remove_selected, color=RED)
+        btn_remove = self._mkbtn(btnf, "🗑 卸载选中", _remove_selected, color=RED)
         self._mkbtn(btnf, "🔄 刷新", _do_scan)
         self._mkbtn(btnf, "✖ 关闭", top.destroy, color=TEXT2)
 
@@ -7790,8 +7828,14 @@ class ActivationModule(BaseModule):
             powershell = str(Path(os.environ.get('SystemRoot', r'C:\Windows')) /
                              'System32' / 'WindowsPowerShell' / 'v1.0' / 'powershell.exe')
             # No Tk wait, no deletion while elevated child may still write.
-            result = subprocess.run([powershell, '-NoProfile', '-NonInteractive',
-                                     '-EncodedCommand', encoded(outer)], capture_output=True)
+            # timeout 必须有：内部 Start-Process -Wait 在等 UAC，用户不理会弹窗时
+            # 这条 run 会无限等，_activating 永远为 True、激活按钮永久禁用。
+            try:
+                result = subprocess.run([powershell, '-NoProfile', '-NonInteractive',
+                                         '-EncodedCommand', encoded(outer)],
+                                        capture_output=True, timeout=900)
+            except subprocess.TimeoutExpired:
+                return 'error', '等待管理员授权或执行超时（15 分钟）；UAC 弹窗可能被搁置，请重试。'
             detail = log.read_text(encoding='utf-8-sig', errors='replace') if log.exists() else ''
             output = (result.stdout or b'') + (result.stderr or b'')
             if b'UTB_UAC_CANCELLED' in output:
@@ -8465,9 +8509,10 @@ class SpaceModule(BaseModule):
                 ok = save_index(entries)
                 state["ts"] = INDEX_FILE.stat().st_mtime if ok and INDEX_FILE.exists() else 0.0
                 state["building"] = False
+                # 保存失败只置标志，由主线程 _tick 渲染：
+                # 后台线程直接调 win.winfo_exists()/info.config 是跨线程 Tk 调用，会偶发崩溃。
                 if not ok:
-                    if win.winfo_exists():
-                        info.config(text="⚠ 索引保存失败（磁盘满或权限不足）", fg=RED)
+                    state["save_error"] = True
 
             threading.Thread(target=work, daemon=True).start()
             # 进度定时刷新（主线程）
@@ -8479,6 +8524,8 @@ class SpaceModule(BaseModule):
                     win.after(500, _tick)
                 else:
                     _show_info()
+                    if state.get("save_error"):
+                        info.config(text="⚠ 索引保存失败（磁盘满或权限不足）", fg=RED)
                     if state["ts"] > 0 and ent.get().strip():
                         _do_search()
             win.after(500, _tick)
@@ -8523,7 +8570,7 @@ class SpaceModule(BaseModule):
             try:
                 subprocess.Popen(["explorer.exe", "/select,", full])
             except Exception:
-                show_warning(self.root, "打开失败", "无法调起资源管理器")
+                show_warning("打开失败", "无法调起资源管理器", parent=self.root)
         tree.bind("<Double-1>", _open_loc)
 
         def _on_close():
