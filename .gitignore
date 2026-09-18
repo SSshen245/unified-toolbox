@@ -1,0 +1,18 @@
+# ── Python 运行环境与缓存 ──
+venv/
+__pycache__/
+*.py[cod]
+
+# ── 打包产物（由 打包.cmd / 统一工具箱.spec 生成）──
+build/
+dist/
+
+# ── 手工代码备份：纳入 git 后不再需要 ──
+backups/
+
+# ── 编辑器 / 系统 ──
+.vscode/
+.idea/
+*.swp
+Thumbs.db
+desktop.ini

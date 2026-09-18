@@ -1,0 +1,5 @@
+# 保持文件原始字节，不做行尾自动转换。
+# 本项目的行尾并不统一：unified/*.py 是 LF，而 打包.cmd / 统一工具箱.spec /
+# 使用说明.txt 是 CRLF，requirements.txt 还带 UTF-8 BOM。
+# 若开启 text=auto 归一化，这些文件会在首次提交时出现整文件级别的假 diff。
+* -text

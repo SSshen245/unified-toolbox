@@ -1,0 +1,6 @@
+﻿psutil==7.2.2  # 进程/端口/硬件信息
+pystray==0.19.5  # 系统托盘
+Pillow==12.3.0  # 图片/剪贴板图像
+pywin32==312  # Windows API
+PyInstaller==6.22.2  # 打包（开发用）
+
