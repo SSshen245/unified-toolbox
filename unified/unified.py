@@ -338,6 +338,10 @@ rem wait a beat: the old instance's singleton mutex is released
 rem a moment later than the process vanishing from tasklist
 ping -n 3 127.0.0.1 >nul
 start "" "%~2" --after-update
+rem PyInstaller onefile validates its PARENT process path at startup;
+rem if this cmd exits instantly the validation can fail with
+rem "Security validation failure". Stay alive a few seconds.
+ping -n 8 127.0.0.1 >nul
 rem (goto) idiom: a running .cmd cannot del itself directly
 (goto) 2>nul & del "%~f0" >nul 2>&1
 """
