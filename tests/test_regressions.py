@@ -274,6 +274,14 @@ class UpdateCheckTests(unittest.TestCase):
             self.assertIsNone(tag)
             self.assertIn("未配置更新源", err or "")
 
+    def test_gitee_source_format_is_validated_offline(self):
+        """`gitee:owner/repo` is the China-friendly source; a malformed one must be
+        rejected with a clear message instead of a network call."""
+        for bad in ("gitee:", "gitee:onlyowner", "gitee:/"):
+            tag, url, name, err = MODULE.fetch_latest_release(bad)
+            self.assertIsNone(tag)
+            self.assertIn("gitee:owner/repo", err or "")
+
 
 class SettingsDefaultsTests(unittest.TestCase):
     def test_every_settings_key_used_in_code_is_registered(self):

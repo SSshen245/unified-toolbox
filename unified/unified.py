@@ -209,24 +209,43 @@ def version_key(v):
 def fetch_latest_release(repo, timeout=15):
     """查最新 Release，返回 (tag, 下载直链, 文件名, 错误串)。
 
+    更新源两种写法：
+      owner/repo          -> GitHub（api.github.com）
+      gitee:owner/repo    -> Gitee（gitee.com/api/v5，国内可直连）
+
     只用标准库 urllib，不引入新依赖（本项目的 exe 才 18MB，不值得为此加包）。
     """
-    repo = (repo or "").strip().strip("/")
-    if not repo or "/" not in repo:
+    spec_ = (repo or "").strip().strip("/")
+    if not spec_:
         return None, None, None, "未配置更新源（需要填 owner/repo）"
-    api = "https://api.github.com/repos/%s/releases/latest" % repo
+    if spec_.lower().startswith("gitee:"):
+        slug = spec_.split(":", 1)[1].strip("/")
+        if "/" not in slug:
+            return None, None, None, "Gitee 更新源格式应为 gitee:owner/repo"
+        api = "https://gitee.com/api/v5/repos/%s/releases/latest" % slug
+        # Gitee 的 browser_download_url 本身就在 gitee.com 上，可直连，无需特殊头
+        headers = {"User-Agent": "UnifiedToolbox-UpdateCheck"}
+        use_api_asset = False
+        who = "Gitee"
+    else:
+        if "/" not in spec_:
+            return None, None, None, "未配置更新源（需要填 owner/repo）"
+        api = "https://api.github.com/repos/%s/releases/latest" % spec_
+        headers = _UPDATE_UA
+        use_api_asset = True
+        who = "GitHub"
     try:
-        req = urllib.request.Request(api, headers=_UPDATE_UA)
+        req = urllib.request.Request(api, headers=headers)
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             data = json.loads(resp.read().decode("utf-8"))
     except urllib.error.HTTPError as e:
         if e.code == 404:
-            return None, None, None, "找不到仓库，或该仓库还没有发布 Release"
+            return None, None, None, who + " 上找不到仓库，或该仓库还没有发布 Release"
         if e.code == 403:
-            return None, None, None, "GitHub 接口限流（每小时 60 次），请稍后再试"
-        return None, None, None, "GitHub 返回 HTTP %s" % e.code
+            return None, None, None, who + " 接口限流，请稍后再试"
+        return None, None, None, who + " 返回 HTTP %s" % e.code
     except Exception as e:
-        return None, None, None, "网络错误：%s" % e
+        return None, None, None, "网络错误（%s）：%s" % (who, e)
 
     tag = data.get("tag_name") or ""
     assets = data.get("assets") or []
@@ -235,13 +254,26 @@ def fetch_latest_release(repo, timeout=15):
     pick = pick or (assets[0] if assets else None)
     if not pick:
         return tag, None, None, "该 Release 没有上传任何文件（需要把 exe 作为附件上传）"
-    return tag, pick.get("browser_download_url"), pick.get("name"), None
+    # GitHub 优先用 API 的 asset 端点（配 Accept: application/octet-stream）下载，而不是
+    # browser_download_url：后者指向 github.com，在 github.com 不可达的网络里
+    # （实测：代理只放行 API/资产域时）会直接超时；而 API 端点会 302 到
+    # release-assets.githubusercontent.com，同一条网络下依然能下。
+    url = pick.get("browser_download_url")
+    if use_api_asset:
+        url = pick.get("url") or url
+    return tag, url, pick.get("name"), None
 
 
 def download_update(url, dest, progress=None, timeout=300):
-    """下载更新包到 dest。progress(done, total) 报进度。返回错误串或 ""。"""
+    """下载更新包到 dest。progress(done, total) 报进度。返回错误串或 ""。
+
+    Accept 必须是 application/octet-stream：asset 端点靠这个头才会返回文件
+    本体（否则返回 JSON 元数据），随后 302 到资产 CDN。
+    """
     try:
-        req = urllib.request.Request(url, headers=_UPDATE_UA)
+        req = urllib.request.Request(url, headers={
+            "User-Agent": "UnifiedToolbox-UpdateCheck",
+            "Accept": "application/octet-stream"})
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             total = int(resp.headers.get("Content-Length") or 0)
             done = 0
@@ -10577,8 +10609,8 @@ class App:
         tk.Button(up_row, text="🔎 检查更新", bg=PANEL2, fg=CYAN, font=(FONT_UI, 9),
                   bd=0, relief="flat", cursor="hand2",
                   command=lambda: self.check_update(repo_var.get())).pack(side="left")
-        tk.Label(f4, text="填 owner/repo（如 myname/toolbox），留空则不启用；"
-                          "检查时才联网，不会后台请求",
+        tk.Label(f4, text="填 owner/repo（如 myname/toolbox）；国内建议填 gitee:owner/repo。"
+                          "留空则不启用；只在点按钮时联网",
                  bg=PANEL, fg=MUTED, font=(FONT_UI, 8)).pack(anchor="w", padx=12, pady=(0, 8))
 
         # ── 底部按钮（btns 已在开头创建并固定到底部） ──
