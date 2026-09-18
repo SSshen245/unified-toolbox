@@ -297,24 +297,28 @@ def main():
     last = "v" + ".".join(map(str, history[-1])) if history else None
     manual = last is not None and version != last
     tag_local = bool(history) and _vtuple(version) == history[-1]
-    remote_tag = False
+    published = False
+    ahead = False
     if tag_local:
-        # 该版本的 tag 是否已经推到远端（= 这个版本是否真的发布过）
-        remote_tag = bool(subprocess.run(["git", "ls-remote", "--tags", "origin", version],
-                                         capture_output=True, text=True,
-                                         timeout=30).stdout.strip())
-    # “无事可做”：工作区干净，且这个版本已经发布到远端
-    if not dirty and tag_local and remote_tag:
-        say("没有需要发布的新改动（工作区干净，且远端已有这个版本的 tag）")
+        published = bool(subprocess.run(["git", "ls-remote", "--tags", "origin", version],
+                                        capture_output=True, text=True,
+                                        timeout=30).stdout.strip())
+        # tag 之后又有新提交（比如上次发布完又修了 bug）也算“有新东西要发”
+        _, tag_commit = git("rev-parse", last + "^{commit}", check=False)
+        _, head_commit = git("rev-parse", "HEAD", check=False)
+        ahead = bool(tag_commit.strip()) and tag_commit.strip() != head_commit.strip()
+    # “无事可做”：工作区干净，且这个版本已经发布到远端，HEAD 也没超前
+    if not dirty and not ahead and published:
+        say("没有需要发布的新改动（工作区干净，最新提交都已发布）")
         return
     if "--no-bump" in flags:
         say("版本号保持 " + version + "（--no-bump）")
     elif manual:
         say(f"检测到你已手动把版本号改成 {version}（上一版 {last}），沿用")
-    elif tag_local and not remote_tag:
+    elif tag_local and not published:
         # 断点续发：上次推到一半断了（tag 打了、没推上去），版本号保持，接着发
         say(f"版本号保持 {version}（它的 tag 在本地还没推到远端，接着把上次没发完的发完）")
-    elif tag_local and remote_tag and dirty:
+    elif published and (dirty or ahead):
         # 这个版本已经发布过，现在又有新改动 → 必须递增，否则老用户收不到更新
         newv = bump_version(version, bump_arg)
         write_version(newv, say)
