@@ -5189,17 +5189,31 @@ class CleanupModule(BaseModule):
         except (OSError, ValueError, TypeError):
             return False
 
+    @staticmethod
+    def _contained(path, root):
+        """path 是否位于 root 之内（含相等）。
+
+        跨盘（不同盘符）的两个路径没有公共父目录，os.path.commonpath 会直接抛
+        ValueError —— 原先这会被外层 except 吞掉后当成"不安全"，导致装在
+        D 盘的缓存/软件让磁盘清理与残留扫描静默失效。跨盘一律按"不在其中"。
+        """
+        try:
+            return os.path.commonpath((path, root)) == root
+        except (TypeError, ValueError):
+            return False
+
     def _is_safe_clean_path(self, path):
         try:
             if not self._plain_path(path):
                 return False, 'Missing, redirected or reparse path'
             rp = os.path.normcase(os.path.realpath(path))
             home = os.path.normcase(os.path.realpath(Path.home()))
-            if rp == home or os.path.dirname(rp) == rp or os.path.commonpath((rp, home)) == rp:
+            if rp == home or os.path.dirname(rp) == rp or self._contained(home, rp):
+                # ^ home 在 rp 里面 = rp 是用户主目录或其祖先（C:\Users、C:\ 这类），保护
                 return False, 'Root/home/ancestor is protected'
             for safe in self._safe_roots():
                 sp = os.path.normcase(os.path.realpath(safe))
-                if os.path.commonpath((rp, sp)) == sp:
+                if self._contained(rp, sp):
                     return True, ''
         except (OSError, ValueError, TypeError):
             pass
@@ -5210,7 +5224,7 @@ class CleanupModule(BaseModule):
         try:
             bp = os.path.normcase(os.path.realpath(base))
             fp = os.path.normcase(os.path.realpath(path))
-            return (fp != bp and os.path.commonpath((bp, fp)) == bp
+            return (fp != bp and self._contained(fp, bp)
                     and self._is_safe_clean_path(path)[0]
                     and stat.S_ISREG(os.lstat(path).st_mode))
         except (OSError, ValueError):
@@ -6353,14 +6367,15 @@ class UninstallModule(BaseModule):
             bases = list(self._RESIDUAL_PF_ROOTS) + [
                 os.path.join(home, 'AppData', 'Local'), os.path.join(home, 'AppData', 'Roaming'),
                 r'C:\ProgramData']
-            if not any(target != canonical(b) and os.path.commonpath((target, canonical(b))) == canonical(b)
+            if not any(target != canonical(b) and CleanupModule._contained(target, canonical(b))
                        for b in bases):
                 return False
             for other in getattr(self, '_all_apps', ()):
                 if other['name'] == app_['name'] or not other.get('install_dir'):
                     continue
                 other_path = canonical(other['install_dir'])
-                if os.path.commonpath((target, other_path)) in (target, other_path):
+                if (CleanupModule._contained(target, other_path)
+                        or CleanupModule._contained(other_path, target)):
                     return False
             # Recursive recycle: reject any nested reparse point or unreadable tree.
             def fail(exc):
