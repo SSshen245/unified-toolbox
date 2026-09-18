@@ -10,7 +10,7 @@ from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
 
 APP_NAME = "统一工具箱"
-APP_VERSION = "v3.7"
+APP_VERSION = "v3.8"
 
 # 托盘支持（可选依赖：缺失时自动降级为普通窗口行为）
 try:
