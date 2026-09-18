@@ -14,10 +14,12 @@
     --no-tests    跳过单元测试
     --no-commit   工作区脏时直接报错退出，不自动提交
     --no-build    只提交 + 打 tag，不打包（改完想先提交、稍后再发版时用）
+    --no-publish  不发布到 GitHub（默认装了 gh 且已登录就会自动发布）
 """
 import hashlib
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -86,6 +88,86 @@ def next_version(v):
     return f"{pre}{major + 1}"
 
 
+# 发布到 GitHub 时用的附件名，必须是纯 ASCII：
+# gh 拿中文文件名当附件名会退化成 default.exe（实测踩过），
+# 而且中文名在下载 URL 里会被百分号编码。
+GH_ASSET_NAME = "UnifiedToolbox.exe"
+
+
+def find_gh():
+    """找 gh CLI：先看 PATH，再看本机便携安装位置。"""
+    for cand in ("gh", "gh.exe"):
+        found = shutil.which(cand)
+        if found:
+            return found
+    extra = Path.home() / ".workbuddy" / "binaries" / "gh" / "bin" / "gh.exe"
+    return str(extra) if extra.exists() else None
+
+
+def origin_slug():
+    """从 origin 远端解析出 owner/repo。"""
+    try:
+        url = subprocess.run(["git", "remote", "get-url", "origin"],
+                             capture_output=True, text=True, timeout=15).stdout.strip()
+    except Exception:
+        return None
+    m = re.search(r"github\.com[:/]+([^/]+)/([^/\s]+?)(?:\.git)?/?$", url)
+    return f"{m.group(1)}/{m.group(2)}" if m else None
+
+
+def publish_to_github(tag, exe, notes_path, say):
+    """把 exe 作为附件发布到 GitHub Release。返回 True/False。
+
+    gh 需要能访问 github.com / uploads.github.com；本机 git 若配了代理，
+    一并传给 gh（gh 不读 git 的 http.proxy，只认环境变量）。
+    """
+    gh = find_gh()
+    if not gh:
+        say("      跳过：没找到 gh CLI（装了 GitHub CLI 后可自动发布）")
+        return False
+    env = dict(os.environ)
+    try:
+        proxy = subprocess.run(["git", "config", "--get", "https.proxy"],
+                               capture_output=True, text=True, timeout=10).stdout.strip()
+        if proxy:
+            env.setdefault("HTTPS_PROXY", proxy)
+            env.setdefault("HTTP_PROXY", proxy)
+    except Exception:
+        pass
+
+    slug = origin_slug()
+    if not slug:
+        say("      跳过：origin 不是 GitHub 仓库")
+        return False
+
+    # 用 ASCII 名的副本上传（本地文件名保持中文不动）
+    ascii_exe = exe.with_name(GH_ASSET_NAME)
+    try:
+        shutil.copy2(exe, ascii_exe)
+    except Exception as e:
+        say(f"      跳过：准备附件失败 {e}")
+        return False
+    try:
+        exists = subprocess.run([gh, "release", "view", tag], env=env,
+                                capture_output=True, text=True).returncode == 0
+        if exists:
+            cmd = [gh, "release", "upload", tag, str(ascii_exe), "--clobber"]
+        else:
+            cmd = [gh, "release", "create", tag, str(ascii_exe),
+                   "--title", tag, "--target", "main", "--generate-notes"]
+            if notes_path and Path(notes_path).exists():
+                cmd += ["--notes-file", str(notes_path)]
+        r = subprocess.run(cmd, env=env, capture_output=True, text=True,
+                           encoding="utf-8", errors="replace")
+        if r.returncode != 0:
+            say(f"      发布失败：{(r.stderr or r.stdout or '').strip()[:400]}")
+            return False
+        say(f"      已发布到 https://github.com/{slug}/releases/tag/{tag}")
+        return True
+    finally:
+        ascii_exe.unlink(missing_ok=True)
+
+
 def read_version():
     text = (ROOT / "unified" / "unified.py").read_text(encoding="utf-8")
     m = re.search(r'^APP_VERSION\s*=\s*"([^"]+)"', text, re.M)
@@ -113,13 +195,14 @@ def main():
         raise SystemExit(1)
 
     version = read_version()
+    notes_file = None          # None = 用 gh --generate-notes 从提交自动生成
     say(f"项目版本：{version}")
 
     # ── 1. 单元测试（失败就别打包了）──
     if "--no-tests" in flags:
-        say("[1/5] 跳过单元测试（--no-tests）")
+        say("[1/6] 跳过单元测试（--no-tests）")
     else:
-        say("[1/5] 运行单元测试…")
+        say("[1/6] 运行单元测试…")
         # 注意：unittest 把汇总写到 stderr，所以两个流都要看；判定用退出码最可靠
         r = subprocess.run([sys.executable, "-m", "unittest", "discover", "-s", "tests"],
                            capture_output=True, text=True,
@@ -135,14 +218,14 @@ def main():
     _, status = git("status", "--porcelain")
     dirty = bool(status.strip())
     if not dirty:
-        say("[2/5] 工作区干净，无需提交")
+        say("[2/6] 工作区干净，无需提交")
     elif "--no-commit" in flags:
-        say("[2/5] 工作区有未提交改动，且指定了 --no-commit，已中止")
+        say("[2/6] 工作区有未提交改动，且指定了 --no-commit，已中止")
         say(status.strip())
         raise SystemExit(1)
     else:
         if not message:
-            say("[2/5] 工作区有未提交改动：")
+            say("[2/6] 工作区有未提交改动：")
             for line in status.strip().splitlines()[:15]:
                 say("      " + line)
             try:
@@ -154,7 +237,7 @@ def main():
         git("add", "-A")
         git("commit", "-m", message)
         _, sha = git("rev-parse", "--short", "HEAD")
-        say(f"[2/5] 已提交 {sha.strip()}：{message}")
+        say(f"[2/6] 已提交 {sha.strip()}：{message}")
 
     _, head = git("rev-parse", "--short", "HEAD")
     head = head.strip()
@@ -171,16 +254,16 @@ def main():
         say("            在线更新的版本比较依赖这个号——重复发同一个号，")
         say("            老用户点「检查更新」会一直提示「已是最新版本」，收不到新包。")
     git("tag", "-a", tag, "-m", f"发版 {tag}")
-    say(f"[3/5] 已打 tag：{tag}")
+    say(f"[3/6] 已打 tag：{tag}")
 
     if "--no-build" in flags:
-        say("[4/5] 跳过打包（--no-build）")
-        say("[5/5] 跳过生成交付包（--no-build）")
+        say("[4/6] 跳过打包（--no-build）")
+        say("[5/6] 跳过生成交付包（--no-build）")
         say("\n完成（仅提交与打 tag）。")
         return
 
     # ── 4. 打包 exe ──
-    say("[4/5] PyInstaller 打包中（约 25~35 秒，请稍候）…")
+    say("[4/6] PyInstaller 打包中（约 25~35 秒，请稍候）…")
     # --log-level WARN：默认 INFO 会刷满整屏，双击运行时更该只看到关键信息
     r = subprocess.run([sys.executable, "-m", "PyInstaller", "统一工具箱.spec",
                         "--noconfirm", "--distpath", "dist", "--workpath", "build",
@@ -203,11 +286,19 @@ def main():
     say(f"      dist\\统一工具箱.exe  {human(exe.stat().st_size)}  md5={md5_of(exe)[:12]}")
 
     # ── 5. 生成交付包（内容来自已提交的 HEAD，所以先提交再打包）──
-    say("[5/5] 生成交付包…")
+    say("[5/6] 生成交付包…")
     zip_path = ROOT / "dist" / "统一工具箱-源码.zip"
     git("archive", "--format=zip", "-o", str(zip_path), "HEAD")
     bundle_path = ROOT / "dist" / "统一工具箱.bundle"
     git("bundle", "create", str(bundle_path), "--all")
+
+    # ── 6. 发布到 GitHub（装了 gh 且已登录就自动做）──
+    published = False
+    if "--no-publish" in flags:
+        say("[6/6] 跳过发布（--no-publish）")
+    else:
+        say("[6/6] 发布到 GitHub Release…")
+        published = publish_to_github(tag, exe, notes_file, say)
 
     say()
     say("=" * 64)
@@ -218,6 +309,13 @@ def main():
     say(f"  统一工具箱.exe          {human(exe.stat().st_size):>9}   给用户，双击即用")
     say(f"  统一工具箱-源码.zip      {human(zip_path.stat().st_size):>9}   给开发者，无 .git")
     say(f"  统一工具箱.bundle       {human(bundle_path.stat().st_size):>9}   给开发者，含完整历史")
+    say()
+    if published:
+        say("已发布到 GitHub Release；用户可用应用里的「检查更新」拿到新版。")
+    else:
+        say("未发布到 GitHub —— 用户暂时拿不到「检查更新」。")
+        say("  · 装了 GitHub CLI 并 gh auth login 之后，再跑一次即可自动发布")
+        say("  · 或手动：把 dist\\统一工具箱.exe 拖到 GitHub 的 Release 页面")
     say()
     say("发给最终用户：只需要 exe（可再带上 使用说明.txt），对方不需要 Python 或 git。")
     say("发给开发者：  发 bundle；对方 git clone 统一工具箱.bundle 目录名")
