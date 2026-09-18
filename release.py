@@ -72,6 +72,20 @@ def md5_of(path):
     return h.hexdigest()
 
 
+def next_version(v):
+    """算出下一个建议版本号："v3.7" -> "v3.8"，"v3.7.1" -> "v3.7.2"。"""
+    m = re.match(r"^(v?)(\d+)(?:\.(\d+))?(?:\.(\d+))?$", str(v).strip())
+    if not m:
+        return str(v) + ".1"
+    pre, major = m.group(1) or "", int(m.group(2))
+    minor, patch = m.group(3), m.group(4)
+    if patch is not None:
+        return f"{pre}{major}.{minor}.{int(patch) + 1}"
+    if minor is not None:
+        return f"{pre}{major}.{int(minor) + 1}"
+    return f"{pre}{major + 1}"
+
+
 def read_version():
     text = (ROOT / "unified" / "unified.py").read_text(encoding="utf-8")
     m = re.search(r'^APP_VERSION\s*=\s*"([^"]+)"', text, re.M)
@@ -152,7 +166,10 @@ def main():
     if existing_tags.strip():
         # 同一个版本号重复发版：加时间戳，避免覆盖已有 tag
         tag = f"{version}-build.{time.strftime('%Y%m%d-%H%M')}"
-        say(f"      提示：tag {version} 已存在（建议在 unified.py 里递增 APP_VERSION）")
+        say(f"      注意：tag {version} 已存在，本次改用 {tag}")
+        say(f"      建议：把 unified.py 里的 APP_VERSION 递增为 {next_version(version)} 再发版。")
+        say("            在线更新的版本比较依赖这个号——重复发同一个号，")
+        say("            老用户点「检查更新」会一直提示「已是最新版本」，收不到新包。")
     git("tag", "-a", tag, "-m", f"发版 {tag}")
     say(f"[3/5] 已打 tag：{tag}")
 

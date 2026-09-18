@@ -234,6 +234,47 @@ class SafeIntTests(unittest.TestCase):
         self.assertEqual(MODULE._as_int(50, 1, lo=5, hi=240), 50)
 
 
+class UpdateCheckTests(unittest.TestCase):
+    """Online update: version compare, ASCII-only constraints, offline safety."""
+
+    def test_version_ordering(self):
+        cases = [("v3.7", "v3.8", True), ("v3.7", "v3.10", True),
+                 ("v3.10", "v3.9", False), ("v3.7", "3.7", False),
+                 ("V3.7", "v3.7.1", True), ("v3.7", "v3.7", False),
+                 ("v3.99", "v4", True), ("v3.7", "", False)]
+        for current, latest, newer in cases:
+            self.assertEqual(
+                MODULE.version_key(latest) > MODULE.version_key(current), newer,
+                f"{latest!r} should{' ' if newer else ' not '}be newer than {current!r}")
+
+    def test_swapper_is_pure_ascii(self):
+        """cmd.exe reads a .cmd using the OEM codepage; one non-ASCII byte would
+        corrupt the Chinese exe path passed via %~1/%~2."""
+        script = MODULE.write_update_swapper()
+        try:
+            raw = script.read_bytes()
+            self.assertTrue(all(b < 128 for b in raw),
+                            "the swapper script must stay ASCII-only")
+            text = raw.decode("ascii")
+            for needed in ("tasklist", "copy /y", "%~1", "%~2", "%3"):
+                self.assertIn(needed, text)
+        finally:
+            script.unlink(missing_ok=True)
+
+    def test_update_user_agent_is_latin1_safe(self):
+        """HTTP headers are latin-1; using APP_NAME (Chinese) made urllib raise
+        "'latin-1' codec can't encode characters"."""
+        ua = MODULE._UPDATE_UA["User-Agent"]
+        ua.encode("ascii")          # would raise UnicodeEncodeError otherwise
+
+    def test_unconfigured_repo_is_a_message_not_a_crash(self):
+        """Must return early without touching the network (keeps tests offline)."""
+        for bad in ("", "   ", "no-slash", "/", None):
+            tag, url, name, err = MODULE.fetch_latest_release(bad)
+            self.assertIsNone(tag)
+            self.assertIn("未配置更新源", err or "")
+
+
 class SettingsDefaultsTests(unittest.TestCase):
     def test_every_settings_key_used_in_code_is_registered(self):
         """Keys missing from DEFAULT_SETTINGS are silently dropped by load_settings,

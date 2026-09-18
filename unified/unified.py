@@ -3,6 +3,7 @@ import tkinter as tk
 from tkinter import ttk
 import threading, queue, time, os, sys, datetime, json, subprocess, re, platform
 import fnmatch, hashlib, tempfile
+import urllib.request, urllib.error
 import ctypes, ctypes.wintypes
 import psutil
 from pathlib import Path
@@ -129,7 +130,9 @@ DEFAULT_SETTINGS = {"hotkey_vk": "V", "close_action": "tray", "autostart": False
                     "float_geo": "",
                     # 窗口状态：maximized = 上次退出时是否最大化；start_maximized =
                     # 用户明确要求"每次启动都最大化"（设置中心可勾）
-                    "maximized": False, "start_maximized": False}
+                    "maximized": False, "start_maximized": False,
+                    # 在线更新源 "owner/repo"，留空 = 不启用（见 UPDATE_REPO_DEFAULT）
+                    "update_repo": ""}
 SETTINGS = dict(DEFAULT_SETTINGS)
 
 
@@ -182,6 +185,112 @@ def _as_int(value, default, lo=None, hi=None):
     if hi is not None and n > hi:
         n = hi
     return n
+
+
+# ═══════════════════════════════════════════
+# 在线更新（可选，默认关闭：填了更新源才生效）
+# ═══════════════════════════════════════════
+# 更新源填 "owner/repo"（GitHub 公开仓库）。留空 = 功能整体不启用。
+# 换源（比如改成 Gitee 或自建）不用改代码：设置中心「关于」里能直接填。
+UPDATE_REPO_DEFAULT = ""
+
+# HTTP 头必须是 latin-1：这里**不能**用 APP_NAME（中文会让 urllib 直接抛
+# "'latin-1' codec can't encode characters"）。用纯 ASCII 的 UA。
+_UPDATE_UA = {"User-Agent": "UnifiedToolbox-UpdateCheck",
+              "Accept": "application/vnd.github+json"}
+
+
+def version_key(v):
+    """把 "v3.7" / "3.10.2" 这类版本串转成可比较的元组（按数字段比大小）。"""
+    parts = re.findall(r"\d+", str(v or ""))
+    return tuple(int(x) for x in parts[:4]) or (0,)
+
+
+def fetch_latest_release(repo, timeout=15):
+    """查最新 Release，返回 (tag, 下载直链, 文件名, 错误串)。
+
+    只用标准库 urllib，不引入新依赖（本项目的 exe 才 18MB，不值得为此加包）。
+    """
+    repo = (repo or "").strip().strip("/")
+    if not repo or "/" not in repo:
+        return None, None, None, "未配置更新源（需要填 owner/repo）"
+    api = "https://api.github.com/repos/%s/releases/latest" % repo
+    try:
+        req = urllib.request.Request(api, headers=_UPDATE_UA)
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            return None, None, None, "找不到仓库，或该仓库还没有发布 Release"
+        if e.code == 403:
+            return None, None, None, "GitHub 接口限流（每小时 60 次），请稍后再试"
+        return None, None, None, "GitHub 返回 HTTP %s" % e.code
+    except Exception as e:
+        return None, None, None, "网络错误：%s" % e
+
+    tag = data.get("tag_name") or ""
+    assets = data.get("assets") or []
+    pick = next((a for a in assets
+                 if str(a.get("name", "")).lower().endswith(".exe")), None)
+    pick = pick or (assets[0] if assets else None)
+    if not pick:
+        return tag, None, None, "该 Release 没有上传任何文件（需要把 exe 作为附件上传）"
+    return tag, pick.get("browser_download_url"), pick.get("name"), None
+
+
+def download_update(url, dest, progress=None, timeout=300):
+    """下载更新包到 dest。progress(done, total) 报进度。返回错误串或 ""。"""
+    try:
+        req = urllib.request.Request(url, headers=_UPDATE_UA)
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            total = int(resp.headers.get("Content-Length") or 0)
+            done = 0
+            with open(dest, "wb") as f:
+                while True:
+                    chunk = resp.read(256 * 1024)
+                    if not chunk:
+                        break
+                    f.write(chunk)
+                    done += len(chunk)
+                    if progress:
+                        progress(done, total)
+        return ""
+    except Exception as e:
+        try:
+            Path(dest).unlink(missing_ok=True)
+        except Exception:
+            pass
+        return "下载失败：%s" % e
+
+
+# 自替换批处理：内容刻意保持纯 ASCII —— 中文路径通过 %~1/%~2 以参数传入，
+# 避免 cmd.exe 按 OEM 代码页读 .cmd 文件时把路径读坏。
+_UPDATE_SWAPPER = """@echo off
+setlocal
+:wait
+tasklist /FI "PID eq %3" 2>nul | find "%3" >nul
+if not errorlevel 1 (
+  ping -n 2 127.0.0.1 >nul
+  goto wait
+)
+copy /y "%~1" "%~2" >nul
+if errorlevel 1 exit /b 1
+del "%~1" >nul 2>&1
+start "" "%~2"
+rem (goto) idiom: a running .cmd cannot del itself directly
+(goto) 2>nul & del "%~f0" >nul 2>&1
+"""
+
+
+def write_update_swapper():
+    """生成"等本进程退出后替换 exe 并重启"的批处理，返回其路径。
+
+    正在运行的 exe 无法覆盖自己（文件被占用），所以必须先下载到别处、
+    等退出后再替换 —— 这是 Windows 上自更新的通用做法。
+    """
+    script = Path(tempfile.gettempdir()) / "utb_apply_update.cmd"
+    script.write_text(_UPDATE_SWAPPER, encoding="ascii")
+    return script
 
 
 def load_settings():
@@ -282,6 +391,28 @@ def kb(n):
     if abs(n) >= 1024**2: return f"{n/1024**2:.1f}M"
     if abs(n) >= 1024: return f"{n/1024:.1f}K"
     return f"{n:.0f}B"
+
+
+def _center_on(child, parent=None, y_ratio=3):
+    """把 child 窗口摆到 parent 中间（越界收敛到屏幕内）。
+
+    parent 为 None 时按屏幕居中。这个"居中 + 夹取"的逻辑原先在十几个弹窗里
+    各抄了一遍，收敛成一个函数，新弹窗直接用。
+    """
+    try:
+        child.update_idletasks()
+        w, h = child.winfo_width(), child.winfo_height()
+        sw, sh = child.winfo_screenwidth(), child.winfo_screenheight()
+        if parent is not None:
+            x = parent.winfo_x() + (parent.winfo_width() - w) // 2
+            y = parent.winfo_y() + (parent.winfo_height() - h) // max(1, y_ratio)
+        else:
+            x, y = (sw - w) // 2, (sh - h) // 3
+        x = max(0, min(x, sw - w - 8))
+        y = max(0, min(y, sh - h - 36))
+        child.geometry("+%d+%d" % (x, y))
+    except Exception:
+        pass
 
 
 def parse_size(s):
@@ -10057,6 +10188,143 @@ class App:
     def _bind_hotkeys(self):
         self.root.bind("<Control-Alt-d>", lambda e: self._switch("clipboard"))
 
+    # ─── 在线更新（只在手动点「检查更新」时联网，不做后台静默请求）───
+    def check_update(self, repo=None):
+        """查最新 Release → 比对版本 → 询问 → 下载 → 退出后自替换并重启。"""
+        repo = (repo if repo is not None else SETTINGS.get("update_repo", "")) or ""
+        repo = repo.strip()
+        if not repo or "/" not in repo:
+            show_info("未配置更新源",
+                      "请先在上面的「更新源」里填 owner/repo，例如 myname/toolbox。\n\n"
+                      "并确认该仓库已发布 Release，且把 exe 作为附件上传。",
+                      parent=getattr(self, "_settings_win", None) or self.root)
+            return
+        win = tk.Toplevel(self.root)
+        win.title("检查更新")
+        win.configure(bg=BG)
+        win.resizable(False, False)
+        win.transient(self.root)
+        enable_dark_title_bar(win)
+        tk.Label(win, text=f"正在检查 {repo} …", bg=BG, fg=TEXT2,
+                 font=(FONT_UI, 9)).pack(padx=26, pady=(20, 8))
+        bar = ttk.Progressbar(win, mode="indeterminate", length=320)
+        bar.pack(padx=26, pady=(0, 18))
+        bar.start(12)
+        win.update_idletasks()
+        _center_on(win, self.root)
+
+        q = queue.Queue()
+        threading.Thread(target=lambda: q.put(fetch_latest_release(repo)),
+                         daemon=True).start()
+
+        def _poll():
+            try:
+                if not win.winfo_exists():
+                    return
+            except Exception:
+                return
+            try:
+                tag, url, name, err = q.get_nowait()
+            except queue.Empty:
+                win.after(200, _poll)
+                return
+            bar.stop()
+            win.destroy()
+            if err:
+                show_warning("检查更新失败", err, parent=self.root)
+                return
+            if not tag:
+                show_warning("检查更新失败", "Release 里没有版本号", parent=self.root)
+                return
+            if version_key(tag) <= version_key(APP_VERSION):
+                show_info("已是最新版本",
+                          f"当前 {APP_VERSION}，最新 {tag}。", parent=self.root)
+                return
+            if not url:
+                show_warning("该版本没有可下载的文件",
+                             f"最新版本 {tag} 的 Release 里没有 exe 附件。\n"
+                             "请在 GitHub 上把打包好的 exe 作为 Release 附件上传。",
+                             parent=self.root)
+                return
+            if not ask_yesno("发现新版本",
+                             f"当前版本：{APP_VERSION}\n最新版本：{tag}\n"
+                             f"更新文件：{name}\n\n"
+                             "现在下载并更新吗？下载完成后程序会自动退出、"
+                             "替换自身并重新启动。",
+                             parent=self.root):
+                return
+            self._download_update(url, name)
+        win.after(200, _poll)
+
+    def _download_update(self, url, name):
+        """下载更新包，然后交给批处理在退出后替换 exe 并重启。"""
+        dest = Path(tempfile.gettempdir()) / (name or "unified_toolbox_new.exe")
+        win = tk.Toplevel(self.root)
+        win.title("下载更新")
+        win.configure(bg=BG)
+        win.resizable(False, False)
+        win.transient(self.root)
+        win.protocol("WM_DELETE_WINDOW", lambda: None)   # 下载中不允许关掉
+        enable_dark_title_bar(win)
+        status = tk.Label(win, text="正在下载…", bg=BG, fg=TEXT2, font=(FONT_UI, 9))
+        status.pack(padx=26, pady=(20, 8))
+        bar = ttk.Progressbar(win, mode="determinate", length=320, maximum=100)
+        bar.pack(padx=26, pady=(0, 18))
+        win.update_idletasks()
+        _center_on(win, self.root)
+
+        prog = {"done": 0, "total": 0}
+        box = {}
+
+        def _work():
+            box["err"] = download_update(
+                url, dest, progress=lambda d, t: prog.update(done=d, total=t))
+
+        threading.Thread(target=_work, daemon=True).start()
+
+        def _poll():
+            try:
+                if not win.winfo_exists():
+                    return
+            except Exception:
+                return
+            if "err" not in box:
+                done, total = prog["done"], prog["total"]
+                if total:
+                    bar.config(value=min(100, done * 100 // total))
+                    status.config(text=f"正在下载… {done/1024/1024:.1f} / "
+                                       f"{total/1024/1024:.1f} MB")
+                else:
+                    status.config(text=f"正在下载… {done/1024/1024:.1f} MB")
+                win.after(150, _poll)
+                return
+            win.destroy()
+            err = box["err"]
+            if err:
+                show_error("更新失败", err, parent=self.root)
+                return
+            self._apply_update(dest)
+        win.after(150, _poll)
+
+    def _apply_update(self, new_exe):
+        """退出前把手交给批处理：等本进程结束 → 覆盖 exe → 重启。"""
+        if not getattr(sys, "frozen", False):
+            # 源码运行：覆盖 python.exe 毫无意义，直接告诉用户拉代码
+            show_info("当前以源码方式运行",
+                      "源码运行不需要自更新，直接更新代码即可（如 git pull）。\n\n"
+                      f"更新包已下载到：\n{new_exe}", parent=self.root)
+            return
+        try:
+            script = write_update_swapper()
+            flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+            subprocess.Popen(["cmd", "/c", str(script), str(new_exe),
+                              sys.executable, str(os.getpid())],
+                             creationflags=flags)
+        except Exception as e:
+            show_error("更新失败", f"无法启动替换程序：{e}", parent=self.root)
+            return
+        self._quit_app()
+
     def show_settings(self):
         """设置中心：主题 / 开机自启 / 关闭行为 / 热键展示 / 剪贴板缓存清理"""
         if getattr(self, "_settings_win", None) is not None and self._settings_win.winfo_exists():
@@ -10289,11 +10557,29 @@ class App:
                    insertbackground=TEXT).pack(side="left")
         tk.Label(r2, text="分钟", bg=PANEL, fg=TEXT2, font=(FONT_UI, 9)).pack(side="left", padx=(2, 0))
 
-        # ── 关于 ──
+        # ── 关于 / 在线更新 ──
         section("◈ 关于")
         f4 = card()
         tk.Label(f4, text=f"{APP_NAME}  {APP_VERSION}   ·   设置保存在 {SETTINGS_FILE.name}",
-                 bg=PANEL, fg=MUTED, font=(FONT_MONO, 8)).pack(anchor="w", padx=12, pady=8)
+                 bg=PANEL, fg=MUTED, font=(FONT_MONO, 8)).pack(anchor="w", padx=12, pady=(8, 4))
+        # 在线更新：默认关闭。填了 owner/repo 才会去查 GitHub Release。
+        # 刻意做成"手动点按钮才联网"，不后台静默请求。
+        up_row = tk.Frame(f4, bg=PANEL)
+        up_row.pack(fill="x", padx=12, pady=(0, 2))
+        tk.Label(up_row, text="更新源", bg=PANEL, fg=TEXT2,
+                 font=(FONT_UI, 9)).pack(side="left")
+        repo_var = tk.StringVar(value=SETTINGS.get("update_repo", "") or "")
+        tk.Entry(up_row, textvariable=repo_var, bg=PANEL2, fg=TEXT,
+                 font=(FONT_MONO, 9), relief="flat", insertbackground=CYAN,
+                 highlightthickness=1, highlightbackground=BORDER,
+                 highlightcolor=CYAN).pack(side="left", fill="x", expand=True,
+                                           padx=(6, 6), ipady=3)
+        tk.Button(up_row, text="🔎 检查更新", bg=PANEL2, fg=CYAN, font=(FONT_UI, 9),
+                  bd=0, relief="flat", cursor="hand2",
+                  command=lambda: self.check_update(repo_var.get())).pack(side="left")
+        tk.Label(f4, text="填 owner/repo（如 myname/toolbox），留空则不启用；"
+                          "检查时才联网，不会后台请求",
+                 bg=PANEL, fg=MUTED, font=(FONT_UI, 8)).pack(anchor="w", padx=12, pady=(0, 8))
 
         # ── 底部按钮（btns 已在开头创建并固定到底部） ──
         def _clamp_spin(var, lo, hi, default):
@@ -10310,6 +10596,7 @@ class App:
                 if not ok:
                     hint.config(text=f"自启设置失败：{err}")
             SETTINGS["close_action"] = close_var.get()
+            SETTINGS["update_repo"] = repo_var.get().strip()
             SETTINGS["start_maximized"] = max_var.get()
             # 让勾选框双向即时生效，避免和"上次是否最大化"打架：
             # 勾上就现在最大化；取消勾且当前正最大化就还原成窗口态
