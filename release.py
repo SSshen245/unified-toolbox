@@ -173,6 +173,9 @@ def publish_to_gitee(tag, exe, say):
                     "tag_name": tag,
                     "name": f"统一工具箱 {tag}",
                     "body": f"同步自 GitHub Release {tag}。更新说明见同名 GitHub Release。",
+                    # tag 还没同步到 Gitee 时，指明在默认分支上建 tag；
+                    # 缺这个参数对不存在的 tag 会返回 400
+                    "target_commitish": "main",
                 })
                 say(f"      Gitee：已创建发行版 {tag}")
             rel_id = rel["id"]
