@@ -144,15 +144,42 @@ def publish_to_github(tag, exe, notes_path, say):
 
     # 先把代码推上去，否则 gh release create --target main 会把 tag 打在
     # 远端的旧提交上，发布的 exe 和仓库代码对不上。
+    # 走代理的网络偶发握手失败，重试 3 次（间隔 5s）能挡掉绝大多数抖动。
     say("      推送代码到 GitHub…")
     try:
-        git("push", "origin", "main")
+        for attempt in (1, 2, 3):
+            r = subprocess.run(["git", "push", "origin", "main"],
+                               capture_output=True, text=True,
+                               encoding="utf-8", errors="replace", timeout=180)
+            if r.returncode == 0:
+                break
+            say(f"      推送失败（第 {attempt}/3 次）："
+                f"{(r.stderr or r.stdout or '').strip().splitlines()[-1][:160] if (r.stderr or r.stdout) else '未知错误'}")
+            if attempt < 3:
+                time.sleep(5)
+        else:
+            say("      发布中止：连续 3 次推送失败。")
+            say("      网络通后再跑一次即可；代码没推上去不能发 Release，")
+            say("      否则 --target main 会把 tag 打在远端旧提交上，exe 与源码对不上。")
+            return False
         existing = subprocess.run(["git", "ls-remote", "--tags", "origin", tag],
-                                  capture_output=True, text=True).stdout.strip()
+                                  capture_output=True, text=True,
+                                  timeout=60).stdout.strip()
         if existing:
             say(f"      tag {tag} 远端已存在，跳过推送")
         else:
-            git("push", "origin", tag)
+            for attempt in (1, 2, 3):
+                r = subprocess.run(["git", "push", "origin", tag],
+                                   capture_output=True, text=True,
+                                   encoding="utf-8", errors="replace", timeout=180)
+                if r.returncode == 0:
+                    break
+                say(f"      tag 推送失败（第 {attempt}/3 次）")
+                if attempt < 3:
+                    time.sleep(5)
+            else:
+                say("      tag 没推上去，中止发布。")
+                return False
     except Exception as e:
         say(f"      发布中止：推送失败（{e}）")
         say("      网络通后再跑一次即可；代码没推上去不能发 Release，")
@@ -210,6 +237,11 @@ def write_version(newv, say):
     path.write_bytes(new.encode("utf-8"))
 
 
+def _vtuple(v):
+    m = re.fullmatch(r"v(\d+(?:\.\d+)*)", str(v).strip())
+    return tuple(int(x) for x in m.group(1).split(".")) if m else None
+
+
 def released_versions():
     """本地 tag 里形如 v1.2(.3) 的版本，按版本号从小到大返回。"""
     _, tags = git("tag", "-l", "v*", check=False)
@@ -264,14 +296,22 @@ def main():
     history = released_versions()
     last = "v" + ".".join(map(str, history[-1])) if history else None
     manual = last is not None and version != last
-    if not dirty and not manual:
-        say("没有需要发布的新改动（工作区干净，且当前版本已经发布过）")
-        say("改点东西再来，或者用 --no-bump / --bump=major 调整版本策略")
+    tag_local = history and _vtuple(version) == history[-1]
+    remote_tag = False
+    if not dirty:
+        # 只在“工作区干净”时才查远端：这是判断“是不是重试发布”的依据
+        remote_tag = bool(subprocess.run(["git", "ls-remote", "--tags", "origin", version],
+                                         capture_output=True, text=True,
+                                         timeout=30).stdout.strip())
+    if not dirty and not manual and remote_tag:
+        say("没有需要发布的新改动（工作区干净，且远端已有这个版本的 tag）")
         return
     if "--no-bump" in flags:
         say("版本号保持 " + version + "（--no-bump）")
     elif manual:
         say(f"检测到你已手动把版本号改成 {version}（上一版 {last}），沿用")
+    elif tag_local:
+        say(f"版本号保持 {version}（本地已有它的 tag，看起来是上次的发布没推完，接着推）")
     else:
         newv = bump_version(version, bump_arg)
         write_version(newv, say)
