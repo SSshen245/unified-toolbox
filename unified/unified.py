@@ -10,7 +10,7 @@ from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
 
 APP_NAME = "统一工具箱"
-APP_VERSION = "v3.10.3"
+APP_VERSION = "v3.10.4"
 
 # 托盘支持（可选依赖：缺失时自动降级为普通窗口行为）
 try:
@@ -365,37 +365,26 @@ rem wait a beat: the old instance's singleton mutex is released
 rem a moment later than the process vanishing from tasklist
 ping -n 3 127.0.0.1 >nul
 rem Marker file: tells the new instance "you were started by the updater".
-rem Needed because explorer.exe cannot forward command-line arguments.
-rem %TEMP% is expanded by cmd itself, so non-ASCII user names stay safe.
+rem Used instead of a command-line argument because this cmd may hand the
+rem launch over. %TEMP% is expanded by cmd itself, so non-ASCII user names
+rem stay safe.
 echo updated> "%TEMP%\utb_after_update.flag"
-rem Preferred launch: hand the new exe to explorer.exe (the Windows shell),
-rem which is always resident. The new instance then has a live parent for its
-rem whole startup, so PyInstaller 6.22+ can always resolve the parent's
-rem executable path.
-rem (Starting the exe directly from this cmd could raise
-rem "Security validation failure: failed to obtain executable path for parent
-rem process", because this cmd deletes itself and its parent path becomes
-rem unresolvable mid-startup.)
-start "" explorer.exe "%~2"
-rem explorer routes the request over DDE to its already-running instance and
-rem occasionally drops it. Confirm the new instance really showed up; if not,
-rem fall back to a direct start while this cmd is still alive (that keeps a
-rem resolvable parent, unlike the old instant-exit behaviour).
-set LAUNCHED=0
-set CHECKS=0
-:check
-tasklist /FI "IMAGENAME eq %~nx2" 2>nul | find /I "%~nx2" >nul
-if not errorlevel 1 set LAUNCHED=1
-if "%LAUNCHED%"=="1" goto launched
-set /a CHECKS+=1
-if %CHECKS% GEQ 20 goto launched
-ping -n 2 127.0.0.1 >nul
-goto check
-:launched
-if "%LAUNCHED%"=="0" start "" "%~2"
-rem Insurance: stay alive ~30 s. If explorer delegates slowly, a living cmd
-rem still keeps every inherited parent path resolvable.
-ping -n 31 127.0.0.1 >nul
+rem Starting the new exe from this cmd needs one very specific guard.
+rem PyInstaller 6.22.1+ (this build uses 6.22.2) makes a onefile child verify
+rem that whoever started it runs the same executable, and only does so when it
+rem INHERITED a _PYI_* environment from its starter. This cmd IS a child of the
+rem old instance, so it carries exactly those variables; without the guard the
+rem new instance treats cmd.exe as its parent and dies with
+rem "Security validation failure: parent process has different executable!".
+rem PYINSTALLER_RESET_ENVIRONMENT=1 tells the bootloader to start as a fresh
+rem top-level process, which skips that verification completely. The bootloader
+rem clears the variable itself, so anything the app spawns later is unaffected.
+set PYINSTALLER_RESET_ENVIRONMENT=1
+start "" "%~2"
+set PYINSTALLER_RESET_ENVIRONMENT=
+rem Insurance: linger a few seconds so the launch is well underway before
+rem this cmd deletes itself.
+ping -n 8 127.0.0.1 >nul
 rem (goto) idiom: a running .cmd cannot del itself directly
 (goto) 2>nul & del "%~f0" >nul 2>&1
 """
@@ -427,7 +416,7 @@ def write_update_swapper():
     等退出后再替换 —— 这是 Windows 上自更新的通用做法。
     注意行尾必须是 CRLF：cmd.exe 对 LF-only 的批处理（goto/括号块）行为不可靠。
     文件名必须唯一：cmd 是边读文件边执行的，而上一次更新的脚本可能还活着
-    （结尾有约 30 秒的保险等待）。若沿用同一个文件名，新一次更新的内容会在旧
+    （结尾有约 8 秒的保险等待）。若沿用同一个文件名，新一次更新的内容会在旧
     cmd 读到一半时被覆写，两个进程都会跳到错位的文件偏移上乱执行——实测会
     出现"替换完成了但新版没起来且没有任何提示"。
     """
@@ -435,6 +424,20 @@ def write_update_swapper():
         "utb_apply_update_%d_%s.cmd" % (os.getpid(), os.urandom(4).hex()))
     script.write_bytes(_UPDATE_SWAPPER.replace("\n", "\r\n").encode("ascii"))
     return script
+
+
+def clean_env_for_update():
+    """给替换脚本一份不含 _PYI_* 的环境（双保险）。
+
+    onefile 打包后，本进程的 _PYI_ARCHIVE_FILE / _PYI_PARENT_PROCESS_LEVEL
+    等变量会被 cmd 一路继承到新 exe 上，让新 exe 误以为自己是"继承运行时
+    环境"的子进程，从而去校验它的直接父进程（cmd.exe），弹出
+    "parent process has different executable!"。批处理里已经用官方开关
+    PYINSTALLER_RESET_ENVIRONMENT=1 从源头掐断，这里再从起点把变量剔干净，
+    两条路各自独立生效。源码运行时本来就没有这些变量，直接返回 None。
+    """
+    env = {k: v for k, v in os.environ.items() if not k.startswith("_PYI_")}
+    return env if len(env) != len(os.environ) else None
 
 
 def load_settings():
@@ -10497,9 +10500,11 @@ class App:
         try:
             script = write_update_swapper()
             flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+            # 环境变量见 clean_env_for_update：不剔干净，新 exe 会去校验
+            # cmd.exe 而不是自己，然后报 "different executable"。
             subprocess.Popen(["cmd", "/c", str(script), str(new_exe),
                               sys.executable, str(os.getpid())],
-                             creationflags=flags)
+                             env=clean_env_for_update(), creationflags=flags)
         except Exception as e:
             show_error("更新失败", f"无法启动替换程序：{e}", parent=self.root)
             return

@@ -320,32 +320,40 @@ class UpdateCheckTests(unittest.TestCase):
                             "the swapper script must stay ASCII-only")
             text = raw.decode("ascii")
             for needed in ("tasklist", "copy /y", "%~1", "%~2", "%~nx2",
-                           "explorer.exe"):
+                           "PYINSTALLER_RESET_ENVIRONMENT"):
                 self.assertIn(needed, text)
         finally:
             script.unlink(missing_ok=True)
 
-    def test_swapper_launches_via_resident_shell(self):
-        """PyInstaller 6.22+ validates the parent process' executable path at
-        startup. Handing the exe to explorer.exe (always resident) keeps a live
-        parent; starting it straight from the swapper made the validation fail
-        with "Security validation failure: failed to obtain executable path for
-        parent proces!" once that cmd deleted itself."""
+    def test_swapper_resets_pyi_environment(self):
+        """After an update the swapper's cmd inherits the OLD instance's _PYI_*
+        variables (that cmd is the old exe's child). Starting the new exe from
+        there makes it treat cmd.exe as its parent and pop
+        "Security validation failure: parent process has different executable!"
+        (reproduced 2/2 in an E2E run under a Chinese path). Setting
+        PYINSTALLER_RESET_ENVIRONMENT=1 tells the bootloader to run as a fresh
+        top-level process, which skips that verification entirely. It must be
+        set BEFORE `start` and cleared afterwards.
+        """
         script = MODULE.write_update_swapper()
         try:
             text = script.read_text("ascii")
         finally:
             script.unlink(missing_ok=True)
-        self.assertIn("start \"\" explorer.exe \"%~2\"", text)
-        # the cmd must stay alive long enough to cover a slow explorer handoff
-        waits = [int(n) for n in re.findall(r"ping -n (\d+) 127\.0\.0\.1 >nul",
-                                            text)]
-        self.assertTrue(max(waits) >= 25,
-                        "swapper should stay alive >=25 s as insurance")
+        self.assertIn("start \"\" \"%~2\"", text)
+        set_line = text.index("set PYINSTALLER_RESET_ENVIRONMENT=1")
+        start_line = text.index("start \"\" \"%~2\"")
+        # search after `start`: the "=1" line also matches the plain "set ...=" prefix
+        unset_line = text.index("set PYINSTALLER_RESET_ENVIRONMENT=", start_line)
+        self.assertLess(set_line, start_line,
+                        "the variable must be set before the exe is started")
+        self.assertLess(start_line, unset_line,
+                        "the variable must be cleared after the start, so that "
+                        "nothing else spawned from this cmd inherits it")
 
     def test_swapper_path_is_unique(self):
         """cmd.exe reads a .cmd incrementally while running it, and the previous
-        swapper is still alive for ~30 s (tail insurance). Reusing one fixed name
+        swapper is still alive for ~8 s (tail insurance). Reusing one fixed name
         let a new update overwrite the file under the old cmd's feet — both then
         jumped to a bogus byte offset, and the new version silently never
         started. Every run must get its own file."""
@@ -361,8 +369,8 @@ class UpdateCheckTests(unittest.TestCase):
             b.unlink(missing_ok=True)
 
     def test_swapper_leaves_after_update_marker(self):
-        """explorer.exe cannot forward argv, so the swapper must write the same
-        marker file that consume_update_flag() reads."""
+        """The swapper must write the same marker file that
+        consume_update_flag() reads, instead of relying on argv."""
         script = MODULE.write_update_swapper()
         try:
             text = script.read_text("ascii")
@@ -382,6 +390,31 @@ class UpdateCheckTests(unittest.TestCase):
             self.assertFalse(MODULE.consume_update_flag())
         finally:
             flag.unlink(missing_ok=True)
+
+    def test_clean_env_for_update_strips_pyi_vars(self):
+        """Second line of defence: strip _PYI_* before spawning the swapper, so
+        the replacing cmd never carries the old runtime environment in the first
+        place. Both this and the swapper's own reset guard must work standalone.
+        """
+        with patch.dict(os.environ,
+                        {"_PYI_ARCHIVE_FILE": r"C:\path\to\旧.exe",
+                         "_PYI_PARENT_PROCESS_LEVEL": "1",
+                         "_PYI_APPLICATION_HOME_DIR": r"C:\Temp\_MEI1234",
+                         "PATH": os.environ.get("PATH", "")},
+                        clear=False):
+            env = MODULE.clean_env_for_update()
+            self.assertIsNotNone(env, "dirty env must trigger a clean copy")
+            self.assertNotIn("_PYI_ARCHIVE_FILE", env)
+            self.assertNotIn("_PYI_PARENT_PROCESS_LEVEL", env)
+            self.assertNotIn("_PYI_APPLICATION_HOME_DIR", env)
+            self.assertEqual(env["PATH"], os.environ["PATH"])
+
+    def test_clean_env_for_update_noop_when_plain(self):
+        """Running from source there are no _PYI_* vars -> pass os.environ
+        through untouched (None = inherit everything, incl. later additions)."""
+        keep = {k: v for k, v in os.environ.items() if not k.startswith("_PYI_")}
+        with patch.dict(os.environ, keep, clear=True):
+            self.assertIsNone(MODULE.clean_env_for_update())
 
     def test_update_flag_absent_is_false(self):
         """No marker -> normal start -> no mutex retry wait."""
