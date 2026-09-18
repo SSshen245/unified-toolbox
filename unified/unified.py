@@ -196,6 +196,11 @@ def _as_int(value, default, lo=None, hi=None):
 # 设置里的 update_repo 留空时会回落到这个内置值。
 UPDATE_REPO_DEFAULT = "SSshen245/unified-toolbox"
 
+# GitHub 被限流/连不上时的自动备用源（通常是在 Gitee 导入的同名仓库）。
+# 前提：Gitee 上要有同名仓库，且 Release 里传了同名附件；fork 的人改成
+# 自己的镜像，留空 = 关闭兜底。没配镜像时兜底会静默失败，不影响主流程。
+UPDATE_REPO_FALLBACK = "gitee:SSshen245/unified-toolbox"
+
 # HTTP 头必须是 latin-1：这里**不能**用 APP_NAME（中文会让 urllib 直接抛
 # "'latin-1' codec can't encode characters"）。用纯 ASCII 的 UA。
 _UPDATE_UA = {"User-Agent": "UnifiedToolbox-UpdateCheck",
@@ -209,18 +214,8 @@ def version_key(v):
     return tuple(int(x) for x in parts[:4]) or (0,)
 
 
-def fetch_latest_release(repo, timeout=15, use_cache=True):
-    """查最新 Release，返回 (tag, 下载直链, 文件名, 错误串)。
-
-    成功结果缓存 10 分钟：匿名接口每 IP 每小时只有 60 次，重复点按钮
-    不该重复消耗额度。
-    """
-    global _CHECK_CACHE
-    repo = (repo or "").strip().strip("/")
-    now = time.time()
-    if use_cache and _CHECK_CACHE["repo"] == repo and now - _CHECK_CACHE["at"] < 600:
-        return _CHECK_CACHE["result"]
-    spec_ = (repo or "").strip().strip("/")
+def _fetch_release_once(spec_, timeout):
+    """单次查询（无缓存）。spec_ 为已剥离空白的 owner/repo 或 gitee:owner/repo。"""
     if not spec_:
         return None, None, None, "未配置更新源（需要填 owner/repo）"
     if spec_.lower().startswith("gitee:"):
@@ -272,8 +267,36 @@ def fetch_latest_release(repo, timeout=15, use_cache=True):
     url = pick.get("browser_download_url")
     if use_api_asset:
         url = pick.get("url") or url
-    result = (tag, url, pick.get("name"), None)
-    _CHECK_CACHE.update(repo=spec_, at=time.time(), result=result)
+    return tag, url, pick.get("name"), None
+
+
+# 不值得兜底的错误：配置类问题，换一个源也解决不了
+_FATAL_PREFIX = ("未配置更新源", "更新源格式", "上找不到仓库", "没有上传任何文件")
+
+
+def fetch_latest_release(repo, timeout=15, use_cache=True):
+    """查最新 Release，返回 (tag, 下载直链, 文件名, 错误串)。
+
+    - 成功结果缓存 10 分钟：匿名接口每 IP 每小时只有 60 次，重复点按钮
+      不该重复消耗额度
+    - GitHub 被限流或连不上时自动改查备用源 UPDATE_REPO_FALLBACK
+      （国内家宽的匿名额度是同公网 IP 的所有人共享的，被陌生人打满
+      自己也会被限）
+    """
+    global _CHECK_CACHE
+    repo = (repo or "").strip().strip("/")
+    now = time.time()
+    if use_cache and _CHECK_CACHE["repo"] == repo and now - _CHECK_CACHE["at"] < 600:
+        return _CHECK_CACHE["result"]
+    result = _fetch_release_once(repo, timeout)
+    err = result[3]
+    if err and not err.startswith(_FATAL_PREFIX) \
+            and not repo.lower().startswith("gitee:") and UPDATE_REPO_FALLBACK:
+        fb = _fetch_release_once(UPDATE_REPO_FALLBACK, timeout)
+        if fb[0]:
+            result = fb
+    if result[3] is None:
+        _CHECK_CACHE.update(repo=repo, at=now, result=result)
     return result
 
 
@@ -10681,7 +10704,7 @@ class App:
                   bd=0, relief="flat", cursor="hand2",
                   command=lambda: self.check_update(repo_var.get())).pack(side="left")
         tk.Label(f4, text="填 owner/repo（如 myname/toolbox）；国内建议填 gitee:owner/repo。"
-                          "留空则用内置更新源；只在点按钮时联网",
+                          "留空则用内置更新源；GitHub 被限流时自动改查内置 Gitee 备用源",
                  bg=PANEL, fg=MUTED, font=(FONT_UI, 8)).pack(anchor="w", padx=12, pady=(0, 8))
 
         # ── 底部按钮（btns 已在开头创建并固定到底部） ──

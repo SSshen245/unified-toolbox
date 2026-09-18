@@ -8,6 +8,7 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 SOURCE = ROOT / "unified" / "unified.py"
@@ -246,6 +247,67 @@ class UpdateCheckTests(unittest.TestCase):
             self.assertEqual(
                 MODULE.version_key(latest) > MODULE.version_key(current), newer,
                 f"{latest!r} should{' ' if newer else ' not '}be newer than {current!r}")
+
+    def test_github_rate_limit_falls_back_to_gitee(self):
+        """GitHub 403 时自动改查备用源（gitee:），不能把限流直接甩给用户。"""
+        import json as _json
+        import time as _time
+        import urllib.error
+        import urllib.request
+
+        calls = []
+
+        class Fake403(urllib.error.HTTPError):
+            def __init__(self):
+                super().__init__("https://api.github.com/x", 403, "rate limited",
+                                 {"X-RateLimit-Reset": str(int(_time.time()) + 600)},
+                                 None)
+
+        class FakeResp:
+            def __init__(self, payload):
+                self._p = _json.dumps(payload).encode()
+
+            def read(self):
+                return self._p
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+        def fake_urlopen(req, timeout=None):
+            host = req.full_url.split("/")[2]
+            calls.append(host)
+            if "github" in host:
+                raise Fake403()
+            return FakeResp({"tag_name": "v9.9", "assets": [
+                {"name": "UnifiedToolbox.exe",
+                 "browser_download_url": "https://gitee.com/o/r/releases/download/v9.9/UnifiedToolbox.exe"}]})
+
+        with patch.object(MODULE.urllib.request, "urlopen", side_effect=fake_urlopen):
+            tag, url, name, err = MODULE.fetch_latest_release(
+                "SSshen245/unified-toolbox", use_cache=False)
+        self.assertIn("api.github.com", calls)
+        self.assertIn("gitee.com", calls)          # 兜底真的发生了
+        self.assertEqual(tag, "v9.9")              # 拿到的是备用源的结果
+        self.assertIn("gitee.com", (url or ""))
+        self.assertIsNone(err)
+
+    def test_gitee_source_never_falls_back_to_itself(self):
+        """更新源本身就是 gitee: 时不能再兜底（会无限循环）。"""
+        import urllib.error
+
+        class Fake404(urllib.error.HTTPError):
+            def __init__(self):
+                super().__init__("https://gitee.com/x", 404, "nf", {}, None)
+
+        with patch.object(MODULE.urllib.request, "urlopen",
+                          side_effect=Fake404()):
+            tag, url, name, err = MODULE.fetch_latest_release(
+                "gitee:SSshen245/unified-toolbox", use_cache=False)
+        self.assertIsNone(tag)
+        self.assertIn("找不到仓库", err)
 
     def test_swapper_is_pure_ascii(self):
         """cmd.exe reads a .cmd using the OEM codepage; one non-ASCII byte would
