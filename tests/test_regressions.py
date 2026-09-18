@@ -256,7 +256,8 @@ class UpdateCheckTests(unittest.TestCase):
             self.assertTrue(all(b < 128 for b in raw),
                             "the swapper script must stay ASCII-only")
             text = raw.decode("ascii")
-            for needed in ("tasklist", "copy /y", "%~1", "%~2", "%3"):
+            for needed in ("tasklist", "copy /y", "%~1", "%~2", "%~nx2",
+                           "--after-update"):
                 self.assertIn(needed, text)
         finally:
             script.unlink(missing_ok=True)

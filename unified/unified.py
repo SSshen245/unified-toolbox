@@ -299,18 +299,34 @@ def download_update(url, dest, progress=None, timeout=300):
 
 # 自替换批处理：内容刻意保持纯 ASCII —— 中文路径通过 %~1/%~2 以参数传入，
 # 避免 cmd.exe 按 OEM 代码页读 .cmd 文件时把路径读坏。
+# 单文件版 PyInstaller 有“引导器+主体”两个进程，主体退出后引导器仍会短暂
+# 占用 exe 文件：所以要等“所有同名 exe 进程”退出，且 copy 失败必须重试
+# （实测：只等当前 PID + copy 一次，单文件版会复制失败且不留任何提示）。
 _UPDATE_SWAPPER = """@echo off
 setlocal
 :wait
-tasklist /FI "PID eq %3" 2>nul | find "%3" >nul
+tasklist /FI "IMAGENAME eq %~nx2" 2>nul | find /I "%~nx2" >nul
 if not errorlevel 1 (
   ping -n 2 127.0.0.1 >nul
   goto wait
 )
+set /a TRIES=0
+:copy
 copy /y "%~1" "%~2" >nul
-if errorlevel 1 exit /b 1
+if not errorlevel 1 goto run
+set /a TRIES+=1
+if %TRIES% GEQ 20 (
+  echo %DATE% %TIME% replace failed: target locked> "%~dp1utb_update_error.txt"
+  exit /b 1
+)
+ping -n 3 127.0.0.1 >nul
+goto copy
+:run
 del "%~1" >nul 2>&1
-start "" "%~2"
+rem wait a beat: the old instance's singleton mutex is released
+rem a moment later than the process vanishing from tasklist
+ping -n 3 127.0.0.1 >nul
+start "" "%~2" --after-update
 rem (goto) idiom: a running .cmd cannot del itself directly
 (goto) 2>nul & del "%~f0" >nul 2>&1
 """
@@ -321,9 +337,10 @@ def write_update_swapper():
 
     正在运行的 exe 无法覆盖自己（文件被占用），所以必须先下载到别处、
     等退出后再替换 —— 这是 Windows 上自更新的通用做法。
+    注意行尾必须是 CRLF：cmd.exe 对 LF-only 的批处理（goto/括号块）行为不可靠。
     """
     script = Path(tempfile.gettempdir()) / "utb_apply_update.cmd"
-    script.write_text(_UPDATE_SWAPPER, encoding="ascii")
+    script.write_bytes(_UPDATE_SWAPPER.replace("\n", "\r\n").encode("ascii"))
     return script
 
 
@@ -10920,6 +10937,9 @@ _SINGLETON_MUTEX = None   # 单实例锁句柄：进程存活期间必须持有
 
 
 def main():
+    # 更新重启时由替换批处理带上：旧实例刚退，互斥锁的释放可能比进程消失晚，
+    # 这种情况下对锁做短暂重试，而不是立刻弹「已在运行」
+    after_update = "--after-update" in sys.argv[1:]
     # 单实例锁：防止两个实例同时写剪贴板历史/设置互相覆盖。
     # 必须用 use_last_error=True 的 WinDLL 读错误码——ctypes 普通调用会干扰 last-error。
     kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
@@ -10937,10 +10957,20 @@ def main():
     existing = kernel32.OpenMutexW(0x00100000, 0, mutex_name)
     if existing:
         kernel32.CloseHandle(existing)
-        ctypes.windll.user32.MessageBoxW(
-            None, "统一工具箱 已经在运行（请检查系统托盘）。",
-            "统一工具箱 已在运行", 0x00000040)
-        return
+        freed = False
+        if after_update:
+            for _ in range(20):          # 最多等 10 秒
+                time.sleep(0.5)
+                existing = kernel32.OpenMutexW(0x00100000, 0, mutex_name)
+                if not existing:
+                    freed = True
+                    break
+                kernel32.CloseHandle(existing)
+        if not freed:
+            ctypes.windll.user32.MessageBoxW(
+                None, "统一工具箱 已经在运行（请检查系统托盘）。",
+                "统一工具箱 已在运行", 0x00000040)
+            return
     _SINGLETON_MUTEX = kernel32.CreateMutexW(None, 0, mutex_name)
     root = tk.Tk()
     root.geometry("1100x900")
