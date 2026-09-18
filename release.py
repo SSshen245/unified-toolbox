@@ -296,22 +296,30 @@ def main():
     history = released_versions()
     last = "v" + ".".join(map(str, history[-1])) if history else None
     manual = last is not None and version != last
-    tag_local = history and _vtuple(version) == history[-1]
+    tag_local = bool(history) and _vtuple(version) == history[-1]
     remote_tag = False
-    if not dirty:
-        # 只在“工作区干净”时才查远端：这是判断“是不是重试发布”的依据
+    if tag_local:
+        # 该版本的 tag 是否已经推到远端（= 这个版本是否真的发布过）
         remote_tag = bool(subprocess.run(["git", "ls-remote", "--tags", "origin", version],
                                          capture_output=True, text=True,
                                          timeout=30).stdout.strip())
-    if not dirty and not manual and remote_tag:
+    # “无事可做”：工作区干净，且这个版本已经发布到远端
+    if not dirty and tag_local and remote_tag:
         say("没有需要发布的新改动（工作区干净，且远端已有这个版本的 tag）")
         return
     if "--no-bump" in flags:
         say("版本号保持 " + version + "（--no-bump）")
     elif manual:
         say(f"检测到你已手动把版本号改成 {version}（上一版 {last}），沿用")
-    elif tag_local:
-        say(f"版本号保持 {version}（本地已有它的 tag，看起来是上次的发布没推完，接着推）")
+    elif tag_local and not remote_tag:
+        # 断点续发：上次推到一半断了（tag 打了、没推上去），版本号保持，接着发
+        say(f"版本号保持 {version}（它的 tag 在本地还没推到远端，接着把上次没发完的发完）")
+    elif tag_local and remote_tag and dirty:
+        # 这个版本已经发布过，现在又有新改动 → 必须递增，否则老用户收不到更新
+        newv = bump_version(version, bump_arg)
+        write_version(newv, say)
+        say(f"      版本 {version} 已发布过，又有新改动：自动递增 -> {newv}")
+        version = newv
     else:
         newv = bump_version(version, bump_arg)
         write_version(newv, say)
