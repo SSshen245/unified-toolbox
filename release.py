@@ -15,6 +15,8 @@
     --no-commit   工作区脏时直接报错退出，不自动提交
     --no-build    只提交 + 打 tag，不打包（改完想先提交、稍后再发版时用）
     --no-publish  不发布到 GitHub（默认装了 gh 且已登录就会自动发布）
+    --no-bump     不自动递增版本号（默认：没手动改过就自动 minor+1）
+    --bump=PART   自动递增的档位：major(v4.0) / minor(v3.9，默认) / patch(v3.8.1)
 """
 import hashlib
 import os
@@ -194,10 +196,51 @@ def read_version():
     return m.group(1)
 
 
+def write_version(newv, say):
+    """把新版本号写回 unified/unified.py，保留原编码与换行风格。"""
+    path = ROOT / "unified" / "unified.py"
+    raw = path.read_bytes()
+    text = raw.decode("utf-8")
+    new, n = re.subn(r'^APP_VERSION\s*=\s*"v[^"]*"', 'APP_VERSION = "%s"' % newv,
+                     text, count=1, flags=re.M)
+    if n != 1:
+        say("[失败] 没能定位 APP_VERSION 那一行")
+        raise SystemExit(1)
+    # 原样写回字节，避免 universal newline 把 CRLF 改成 LF
+    path.write_bytes(new.encode("utf-8"))
+
+
+def released_versions():
+    """本地 tag 里形如 v1.2(.3) 的版本，按版本号从小到大返回。"""
+    _, tags = git("tag", "-l", "v*", check=False)
+    out = []
+    for t in (tags or "").split():
+        if re.fullmatch(r"v\d+(\.\d+)*", t):
+            out.append(tuple(int(x) for x in t[1:].split(".")))
+    return sorted(out)
+
+
+def bump_version(v, part="minor"):
+    """v3.8 --minor--> v3.9；--major--> v4.0；--patch--> v3.8.1"""
+    m = re.fullmatch(r"v?(\d+)(?:\.(\d+))?(?:\.(\d+))?", str(v).strip())
+    if not m:
+        return str(v)
+    a, b, c = int(m.group(1)), int(m.group(2) or 0), int(m.group(3) or 0)
+    if part == "major":
+        return f"v{a + 1}.0"
+    if part == "patch":
+        return f"v{a}.{b}.{c + 1}"
+    return f"v{a}.{b + 1}"
+
+
 def main():
     args = [a for a in sys.argv[1:] if not a.startswith("--")]
     flags = {a for a in sys.argv[1:] if a.startswith("--")}
     message = args[0] if args else ""
+    bump_arg = next((f.split("=", 1)[1] for f in flags if f.startswith("--bump=")), "minor")
+    if bump_arg not in ("major", "minor", "patch"):
+        say("[失败] --bump 只支持 major / minor / patch")
+        raise SystemExit(1)
 
     say("=" * 64)
     say("  统一工具箱 · 一键发版")
@@ -214,6 +257,27 @@ def main():
     version = read_version()
     notes_file = None          # None = 用 gh --generate-notes 从提交自动生成
     say(f"项目版本：{version}")
+
+    # ── 0.5 版本号：用户没手动递增就自动 +1 ──
+    _, status = git("status", "--porcelain")
+    dirty = bool(status.strip())
+    history = released_versions()
+    last = "v" + ".".join(map(str, history[-1])) if history else None
+    manual = last is not None and version != last
+    if not dirty and not manual:
+        say("没有需要发布的新改动（工作区干净，且当前版本已经发布过）")
+        say("改点东西再来，或者用 --no-bump / --bump=major 调整版本策略")
+        return
+    if "--no-bump" in flags:
+        say("版本号保持 " + version + "（--no-bump）")
+    elif manual:
+        say(f"检测到你已手动把版本号改成 {version}（上一版 {last}），沿用")
+    else:
+        newv = bump_version(version, bump_arg)
+        write_version(newv, say)
+        say(f"      版本号自动递增：{version} -> {newv}"
+            f"（想自己控制就用 --no-bump，或 --bump=major / --bump=patch）")
+        version = newv
 
     # ── 1. 单元测试（失败就别打包了）──
     if "--no-tests" in flags:
