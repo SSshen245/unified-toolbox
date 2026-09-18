@@ -10,7 +10,7 @@ from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
 
 APP_NAME = "统一工具箱"
-APP_VERSION = "v3.10.2"
+APP_VERSION = "v3.10.3"
 
 # 托盘支持（可选依赖：缺失时自动降级为普通窗口行为）
 try:
@@ -340,7 +340,7 @@ def download_update(url, dest, progress=None, timeout=300):
 # 单文件版 PyInstaller 有“引导器+主体”两个进程，主体退出后引导器仍会短暂
 # 占用 exe 文件：所以要等“所有同名 exe 进程”退出，且 copy 失败必须重试
 # （实测：只等当前 PID + copy 一次，单文件版会复制失败且不留任何提示）。
-_UPDATE_SWAPPER = """@echo off
+_UPDATE_SWAPPER = r"""@echo off
 setlocal
 :wait
 tasklist /FI "IMAGENAME eq %~nx2" 2>nul | find /I "%~nx2" >nul
@@ -364,14 +364,60 @@ del "%~1" >nul 2>&1
 rem wait a beat: the old instance's singleton mutex is released
 rem a moment later than the process vanishing from tasklist
 ping -n 3 127.0.0.1 >nul
-start "" "%~2" --after-update
-rem PyInstaller onefile validates its PARENT process path at startup;
-rem if this cmd exits instantly the validation can fail with
-rem "Security validation failure". Stay alive a few seconds.
-ping -n 8 127.0.0.1 >nul
+rem Marker file: tells the new instance "you were started by the updater".
+rem Needed because explorer.exe cannot forward command-line arguments.
+rem %TEMP% is expanded by cmd itself, so non-ASCII user names stay safe.
+echo updated> "%TEMP%\utb_after_update.flag"
+rem Preferred launch: hand the new exe to explorer.exe (the Windows shell),
+rem which is always resident. The new instance then has a live parent for its
+rem whole startup, so PyInstaller 6.22+ can always resolve the parent's
+rem executable path.
+rem (Starting the exe directly from this cmd could raise
+rem "Security validation failure: failed to obtain executable path for parent
+rem process", because this cmd deletes itself and its parent path becomes
+rem unresolvable mid-startup.)
+start "" explorer.exe "%~2"
+rem explorer routes the request over DDE to its already-running instance and
+rem occasionally drops it. Confirm the new instance really showed up; if not,
+rem fall back to a direct start while this cmd is still alive (that keeps a
+rem resolvable parent, unlike the old instant-exit behaviour).
+set LAUNCHED=0
+set CHECKS=0
+:check
+tasklist /FI "IMAGENAME eq %~nx2" 2>nul | find /I "%~nx2" >nul
+if not errorlevel 1 set LAUNCHED=1
+if "%LAUNCHED%"=="1" goto launched
+set /a CHECKS+=1
+if %CHECKS% GEQ 20 goto launched
+ping -n 2 127.0.0.1 >nul
+goto check
+:launched
+if "%LAUNCHED%"=="0" start "" "%~2"
+rem Insurance: stay alive ~30 s. If explorer delegates slowly, a living cmd
+rem still keeps every inherited parent path resolvable.
+ping -n 31 127.0.0.1 >nul
 rem (goto) idiom: a running .cmd cannot del itself directly
 (goto) 2>nul & del "%~f0" >nul 2>&1
 """
+
+
+_UPDATE_FLAG_NAME = "utb_after_update.flag"   # 必须与上面批处理里的名字一致
+
+
+def consume_update_flag():
+    """取用「本次是更新后重启」标记：存在则返回 True 并删除。
+
+    替换批处理用 explorer.exe 拉起新 exe，而 explorer 不能转发命令行参数，
+    所以改用这个临时文件传话。读到就删，避免下一次手动启动被误判成更新重启。
+    """
+    try:
+        flag = Path(tempfile.gettempdir()) / _UPDATE_FLAG_NAME
+        if flag.exists():
+            flag.unlink(missing_ok=True)
+            return True
+    except OSError:
+        pass
+    return False
 
 
 def write_update_swapper():
@@ -380,8 +426,13 @@ def write_update_swapper():
     正在运行的 exe 无法覆盖自己（文件被占用），所以必须先下载到别处、
     等退出后再替换 —— 这是 Windows 上自更新的通用做法。
     注意行尾必须是 CRLF：cmd.exe 对 LF-only 的批处理（goto/括号块）行为不可靠。
+    文件名必须唯一：cmd 是边读文件边执行的，而上一次更新的脚本可能还活着
+    （结尾有约 30 秒的保险等待）。若沿用同一个文件名，新一次更新的内容会在旧
+    cmd 读到一半时被覆写，两个进程都会跳到错位的文件偏移上乱执行——实测会
+    出现"替换完成了但新版没起来且没有任何提示"。
     """
-    script = Path(tempfile.gettempdir()) / "utb_apply_update.cmd"
+    script = Path(tempfile.gettempdir()) / (
+        "utb_apply_update_%d_%s.cmd" % (os.getpid(), os.urandom(4).hex()))
     script.write_bytes(_UPDATE_SWAPPER.replace("\n", "\r\n").encode("ascii"))
     return script
 
@@ -10979,9 +11030,21 @@ _SINGLETON_MUTEX = None   # 单实例锁句柄：进程存活期间必须持有
 
 
 def main():
+    # 工作目录必须固定在 exe 所在目录：图标、临时导出等用的都是相对路径。
+    # 双击/快捷方式启动时系统给的就是这个目录，但被 explorer.exe 拉起
+    # （自更新重启走的就是这条路）时会继承 explorer 的目录（如 System32），
+    # 相对资源会全部找不到。顺便避免 DLL 从陌生目录被加载。
+    try:
+        _base = os.path.dirname(sys.executable) if getattr(sys, "frozen", False) \
+            else os.path.dirname(os.path.abspath(__file__))
+        os.chdir(_base)
+    except OSError:
+        pass
     # 更新重启时由替换批处理带上：旧实例刚退，互斥锁的释放可能比进程消失晚，
     # 这种情况下对锁做短暂重试，而不是立刻弹「已在运行」
-    after_update = "--after-update" in sys.argv[1:]
+    # 两种通知方式都认：命令行参数（老方式/手动测试）与临时标记文件
+    # （explorer.exe 拉起时无法传参，只能靠标记文件传话）
+    after_update = "--after-update" in sys.argv[1:] or consume_update_flag()
     # 单实例锁：防止两个实例同时写剪贴板历史/设置互相覆盖。
     # 必须用 use_last_error=True 的 WinDLL 读错误码——ctypes 普通调用会干扰 last-error。
     kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)

@@ -5,6 +5,7 @@ normal `unittest discover -s tests` sweep.
 """
 import importlib.util
 import os
+import re
 import tempfile
 import unittest
 from pathlib import Path
@@ -319,10 +320,74 @@ class UpdateCheckTests(unittest.TestCase):
                             "the swapper script must stay ASCII-only")
             text = raw.decode("ascii")
             for needed in ("tasklist", "copy /y", "%~1", "%~2", "%~nx2",
-                           "--after-update"):
+                           "explorer.exe"):
                 self.assertIn(needed, text)
         finally:
             script.unlink(missing_ok=True)
+
+    def test_swapper_launches_via_resident_shell(self):
+        """PyInstaller 6.22+ validates the parent process' executable path at
+        startup. Handing the exe to explorer.exe (always resident) keeps a live
+        parent; starting it straight from the swapper made the validation fail
+        with "Security validation failure: failed to obtain executable path for
+        parent proces!" once that cmd deleted itself."""
+        script = MODULE.write_update_swapper()
+        try:
+            text = script.read_text("ascii")
+        finally:
+            script.unlink(missing_ok=True)
+        self.assertIn("start \"\" explorer.exe \"%~2\"", text)
+        # the cmd must stay alive long enough to cover a slow explorer handoff
+        waits = [int(n) for n in re.findall(r"ping -n (\d+) 127\.0\.0\.1 >nul",
+                                            text)]
+        self.assertTrue(max(waits) >= 25,
+                        "swapper should stay alive >=25 s as insurance")
+
+    def test_swapper_path_is_unique(self):
+        """cmd.exe reads a .cmd incrementally while running it, and the previous
+        swapper is still alive for ~30 s (tail insurance). Reusing one fixed name
+        let a new update overwrite the file under the old cmd's feet — both then
+        jumped to a bogus byte offset, and the new version silently never
+        started. Every run must get its own file."""
+        a = MODULE.write_update_swapper()
+        b = MODULE.write_update_swapper()
+        try:
+            self.assertNotEqual(a, b)
+            self.assertTrue(a.name.startswith("utb_apply_update_"))
+            self.assertTrue(a.exists())
+            self.assertTrue(b.exists())
+        finally:
+            a.unlink(missing_ok=True)
+            b.unlink(missing_ok=True)
+
+    def test_swapper_leaves_after_update_marker(self):
+        """explorer.exe cannot forward argv, so the swapper must write the same
+        marker file that consume_update_flag() reads."""
+        script = MODULE.write_update_swapper()
+        try:
+            text = script.read_text("ascii")
+        finally:
+            script.unlink(missing_ok=True)
+        # %TEMP% is expanded by cmd: keeps non-ASCII user names out of the script
+        self.assertIn('"%TEMP%\\' + MODULE._UPDATE_FLAG_NAME + '"', text)
+
+    def test_update_flag_is_consumed_once(self):
+        """Reading the marker must delete it: otherwise every manual start after
+        an update would be treated as a post-update restart."""
+        flag = Path(tempfile.gettempdir()) / MODULE._UPDATE_FLAG_NAME
+        try:
+            flag.write_text("updated", encoding="ascii")
+            self.assertTrue(MODULE.consume_update_flag())
+            self.assertFalse(flag.exists())
+            self.assertFalse(MODULE.consume_update_flag())
+        finally:
+            flag.unlink(missing_ok=True)
+
+    def test_update_flag_absent_is_false(self):
+        """No marker -> normal start -> no mutex retry wait."""
+        (Path(tempfile.gettempdir()) / MODULE._UPDATE_FLAG_NAME).unlink(
+            missing_ok=True)
+        self.assertFalse(MODULE.consume_update_flag())
 
     def test_update_user_agent_is_latin1_safe(self):
         """HTTP headers are latin-1; using APP_NAME (Chinese) made urllib raise
