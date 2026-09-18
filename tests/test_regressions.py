@@ -267,6 +267,11 @@ class UpdateCheckTests(unittest.TestCase):
         ua = MODULE._UPDATE_UA["User-Agent"]
         ua.encode("ascii")          # would raise UnicodeEncodeError otherwise
 
+    def test_builtin_update_source_format(self):
+        """UPDATE_REPO_DEFAULT ships inside the exe, so it must stay a valid
+        `owner/repo` string or every user's 检查更新 breaks."""
+        self.assertRegex(MODULE.UPDATE_REPO_DEFAULT, r"^[^/\s]+/[^/\s]+$")
+
     def test_unconfigured_repo_is_a_message_not_a_crash(self):
         """Must return early without touching the network (keeps tests offline)."""
         for bad in ("", "   ", "no-slash", "/", None):

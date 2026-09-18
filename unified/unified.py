@@ -190,9 +190,11 @@ def _as_int(value, default, lo=None, hi=None):
 # ═══════════════════════════════════════════
 # 在线更新（可选，默认关闭：填了更新源才生效）
 # ═══════════════════════════════════════════
-# 更新源填 "owner/repo"（GitHub 公开仓库）。留空 = 功能整体不启用。
-# 换源（比如改成 Gitee 或自建）不用改代码：设置中心「关于」里能直接填。
-UPDATE_REPO_DEFAULT = ""
+# 更新源填 "owner/repo"（GitHub 公开仓库）。
+# 这里内置本项目自己的仓库，让发布出去的 exe 开箱即可「检查更新」；
+# fork/二次分发的人改掉这行即可指向自己的仓库。
+# 设置里的 update_repo 留空时会回落到这个内置值。
+UPDATE_REPO_DEFAULT = "SSshen245/unified-toolbox"
 
 # HTTP 头必须是 latin-1：这里**不能**用 APP_NAME（中文会让 urllib 直接抛
 # "'latin-1' codec can't encode characters"）。用纯 ASCII 的 UA。
@@ -2922,26 +2924,46 @@ class HomeModule(BaseModule):
         grid.pack(fill="both", expand=True, padx=20, pady=(0, 14))
         grid.grid_columnconfigure((0,1), weight=1)
         grid.grid_rowconfigure((0,1,2), weight=1)
-        navs = [("🔧 硬件诊断", "hardware", CYAN),
-                        ("📋 剪贴板历史", "clipboard", GREEN),
-                        ("🧹 空间清理", "space", PURPLE),
-                        ("📦 软件管家", "software", ORANGE),
-                        ("🚀 快速启动", "launch", GREEN),
-                        ("🧾 新机验机", "verify", GREEN)]
-        for i, (title, mod_name, clr) in enumerate(navs):
+        navs = [("🔧 硬件诊断", "hardware", CYAN,
+                 "CPU / 内存 / GPU / 磁盘健康 / 进程 / 端口"),
+                ("📋 剪贴板历史", "clipboard", GREEN,
+                 "全局历史 · 搜索置顶 · 图片 OCR · 片段库"),
+                ("🧹 空间清理", "space", PURPLE,
+                 "垃圾扫描 · 空目录 · 大文件 · 文件占用"),
+                ("📦 软件管家", "software", ORANGE,
+                 "卸载 · winget 升级 · 预装体检 · 残留扫描"),
+                ("🚀 快速启动", "launch", GREEN,
+                 "常用程序 / 文件夹 / 网址一键直达"),
+                ("🧾 新机验机", "verify", GREEN,
+                 "整机配置 · 亮暗点 · 键盘 · 驱动 · 激活")]
+        for i, (title, mod_name, clr, desc) in enumerate(navs):
             r, c = divmod(i, 2)
             card = tk.Frame(grid, bg=PANEL, highlightthickness=1,
                             highlightbackground=BORDER)
             card.grid(row=r, column=c, padx=6, pady=4, sticky="nsew")
-            btn = tk.Button(card, text=f"{title}", bg=PANEL, fg=clr,
-                            font=(FONT_UI, 16, "bold"), bd=0, relief="flat",
-                            cursor="hand2",
-                            command=lambda n=mod_name: self.app._switch(n))
-            btn.pack(fill="both", expand=True, padx=20, pady=18)
-            btn.bind("<Enter>", lambda e=None, b=btn, cd=card, cl=clr: (
-                b.config(bg=PANEL2), cd.config(highlightbackground=cl)))
-            btn.bind("<Leave>", lambda e=None, b=btn, cd=card: (
-                b.config(bg=PANEL), cd.config(highlightbackground=BORDER)))
+            # 标题 + 一行说明：只有标题的卡片对第一次用的人等于没有信息
+            title_lbl = tk.Label(card, text=title, bg=PANEL, fg=clr,
+                                 font=(FONT_UI, 15, "bold"), cursor="hand2")
+            title_lbl.pack(pady=(16, 2))
+            desc_lbl = tk.Label(card, text=desc, bg=PANEL, fg=MUTED,
+                                font=(FONT_UI, 8), cursor="hand2")
+            desc_lbl.pack(pady=(0, 14))
+
+            def _enter(_e=None, cd=card, cl=clr):
+                cd.config(highlightbackground=cl)
+                for w in (title_lbl, desc_lbl):
+                    w.config(bg=PANEL2)
+
+            def _leave(_e=None, cd=card):
+                cd.config(highlightbackground=BORDER)
+                for w in (title_lbl, desc_lbl):
+                    w.config(bg=PANEL)
+
+            # 整张卡片都可点（不只标题那一行）
+            for w in (card, title_lbl, desc_lbl):
+                w.bind("<Button-1>", lambda e, n=mod_name: self.app._switch(n))
+                w.bind("<Enter>", _enter)
+                w.bind("<Leave>", _leave)
 
     def start(self): pass
     def stop(self): pass
@@ -10223,7 +10245,8 @@ class App:
     # ─── 在线更新（只在手动点「检查更新」时联网，不做后台静默请求）───
     def check_update(self, repo=None):
         """查最新 Release → 比对版本 → 询问 → 下载 → 退出后自替换并重启。"""
-        repo = (repo if repo is not None else SETTINGS.get("update_repo", "")) or ""
+        repo = (repo if repo is not None else SETTINGS.get("update_repo", "")) \
+            or UPDATE_REPO_DEFAULT
         repo = repo.strip()
         if not repo or "/" not in repo:
             show_info("未配置更新源",
@@ -10600,7 +10623,8 @@ class App:
         up_row.pack(fill="x", padx=12, pady=(0, 2))
         tk.Label(up_row, text="更新源", bg=PANEL, fg=TEXT2,
                  font=(FONT_UI, 9)).pack(side="left")
-        repo_var = tk.StringVar(value=SETTINGS.get("update_repo", "") or "")
+        repo_var = tk.StringVar(value=(SETTINGS.get("update_repo", "") or "").strip()
+                                or UPDATE_REPO_DEFAULT)
         tk.Entry(up_row, textvariable=repo_var, bg=PANEL2, fg=TEXT,
                  font=(FONT_MONO, 9), relief="flat", insertbackground=CYAN,
                  highlightthickness=1, highlightbackground=BORDER,
@@ -10610,7 +10634,7 @@ class App:
                   bd=0, relief="flat", cursor="hand2",
                   command=lambda: self.check_update(repo_var.get())).pack(side="left")
         tk.Label(f4, text="填 owner/repo（如 myname/toolbox）；国内建议填 gitee:owner/repo。"
-                          "留空则不启用；只在点按钮时联网",
+                          "留空则用内置更新源；只在点按钮时联网",
                  bg=PANEL, fg=MUTED, font=(FONT_UI, 8)).pack(anchor="w", padx=12, pady=(0, 8))
 
         # ── 底部按钮（btns 已在开头创建并固定到底部） ──
