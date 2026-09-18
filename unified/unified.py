@@ -199,7 +199,7 @@ UPDATE_REPO_DEFAULT = "SSshen245/unified-toolbox"
 # GitHub 被限流/连不上时的自动备用源（通常是在 Gitee 导入的同名仓库）。
 # 前提：Gitee 上要有同名仓库，且 Release 里传了同名附件；fork 的人改成
 # 自己的镜像，留空 = 关闭兜底。没配镜像时兜底会静默失败，不影响主流程。
-UPDATE_REPO_FALLBACK = "gitee:szsz/unified-toolbox"
+UPDATE_REPO_FALLBACK = "gitee:szszz/unified-toolbox"
 
 # HTTP 头必须是 latin-1：这里**不能**用 APP_NAME（中文会让 urllib 直接抛
 # "'latin-1' codec can't encode characters"）。用纯 ASCII 的 UA。
