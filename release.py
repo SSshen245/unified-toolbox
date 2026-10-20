@@ -113,6 +113,25 @@ def _gitee_token():
     return t
 
 
+def _gitee_file_form(token, file_path, boundary="----utbForm7d1a2f9c"):
+    """构造 Gitee 附件上传的 multipart 表单。
+
+    filename 必须用文件真实 basename。之前固定写成 UnifiedToolbox.exe，
+    导致 .sha256 也被存成 exe，Gitee 下载会拿到 86 字节的“假 exe”。
+    """
+    filename = Path(file_path).name
+    pre = (f"--{boundary}\r\n"
+           f'Content-Disposition: form-data; name="access_token"\r\n\r\n'
+           f"{token}\r\n").encode()
+    mid = (f"--{boundary}\r\n"
+           f'Content-Disposition: form-data; name="file"; '
+           f'filename="{filename}"\r\n'
+           f"Content-Type: application/octet-stream\r\n\r\n").encode()
+    body = pre + mid + Path(file_path).read_bytes() + \
+        f"\r\n--{boundary}--\r\n".encode()
+    return body, f"multipart/form-data; boundary={boundary}"
+
+
 def publish_to_gitee(tag, exe, say):
     """把 exe 同步发布到 Gitee（国内兜底更新源的数据来源）。
 
@@ -136,17 +155,8 @@ def publish_to_gitee(tag, exe, say):
         url = f"{api}{path}"
         body, headers = None, {}
         if file_path:
-            boundary = "----utbForm7d1a2f9c"
-            pre = (f"--{boundary}\r\n"
-                   f'Content-Disposition: form-data; name="access_token"\r\n\r\n'
-                   f"{token}\r\n").encode()
-            mid = (f"--{boundary}\r\n"
-                   f'Content-Disposition: form-data; name="file"; '
-                   f'filename="{GH_ASSET_NAME}"\r\n'
-                   f"Content-Type: application/octet-stream\r\n\r\n").encode()
-            body = pre + mid + Path(file_path).read_bytes() + \
-                f"\r\n--{boundary}--\r\n".encode()
-            headers["Content-Type"] = f"multipart/form-data; boundary={boundary}"
+            body, content_type = _gitee_file_form(token, file_path)
+            headers["Content-Type"] = content_type
         else:
             data = dict(data or {})
             data["access_token"] = token

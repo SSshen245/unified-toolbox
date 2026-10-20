@@ -7,7 +7,7 @@
 [![版本](https://img.shields.io/badge/版本-v3.10.6-blue)](../../releases)
 [![平台](https://img.shields.io/badge/平台-Windows%2010%2F11-lightgrey)](#-快速开始)
 [![运行时](https://img.shields.io/badge/运行时-Python%203.11-yellow)](#%EF%B8%8F-从源码运行开发)
-[![测试](https://img.shields.io/badge/测试-112%20通过-brightgreen)](#%EF%B8%8F-开发与测试)
+[![测试](https://img.shields.io/badge/测试-113%20通过-brightgreen)](#%EF%B8%8F-开发与测试)
 
 **[下载最新版](../../releases/latest)** · [功能一览](#-功能一览) · [使用说明](#-使用说明) · [从源码运行](#%EF%B8%8F-从源码运行开发)
 
@@ -122,7 +122,7 @@ venv\Scripts\python.exe -m pip install -r requirements.txt
 :: 2. 直接跑源码（改完立即生效，不需要打包）
 venv\Scripts\python.exe unified\unified.py
 
-:: 3. 跑测试（112 项）
+:: 3. 跑测试（113 项）
 venv\Scripts\python.exe -m unittest discover -s tests
 
 :: 4. 打包 exe
@@ -135,7 +135,7 @@ venv\Scripts\python.exe -m unittest discover -s tests
 
 ```
 跑单元测试（不过就中止）→ 自动提交 → 按 APP_VERSION 打 tag
-→ PyInstaller 打包 → 生成源码 zip / bundle → 发布到 GitHub Release
+→ PyInstaller 打包 → 生成源码 zip / bundle → 发布到 GitHub Release（配了 Gitee token 时同步）
 ```
 
 需要 `gh`（GitHub CLI）并已 `gh auth login`；不想到 GitHub 发布就加 `--no-publish`。
@@ -147,7 +147,7 @@ venv\Scripts\python.exe -m unittest discover -s tests
 
 ```
 unified/unified.py     全部应用代码（单文件，约 1.18 万行）
-tests/                 单元测试（112 项，AST/mock 级）+ 集成检查（7 项）
+tests/                 单元测试（113 项，AST/mock 级）+ 集成检查（7 项）
 docs/img/              截图
 release.py             一键发版逻辑（被 发版.cmd 调用）
 发版.cmd               双击入口：测试 → 提交 → 打 tag → 打包 → 发布

@@ -167,6 +167,8 @@
 - `as_dict()` / `from_mapping()` 负责自定义配色文件与导出 JSON 的往返；导入时校验缺字段、非字符串颜色，并把 JSON 里的 `STRIP` 列表规范回二元组，坏文件回退到 `CYAN/BORDER`；
 - 设置中心、渐变条、预览块全部改为属性访问，不再按下标取字典。
 **回归测试**：新增 `ThemePaletteTests` 5 项（四套内置配色完整且不可变、`apply_theme` 别名导出不污染调色板、未知主题回落 blue、自定义文件校验与 `STRIP` 归一化、连续替换自定义配色时 `ACTIVE_PALETTE` 仍指向真正显示的对象）；集成检查里连续替换两次自定义配色并断言页面实际换色。
-实测：112 项单元测试、7 项集成检查、`ruff` 与 `compileall` 全过。
+实测：113 项单元测试、7 项集成检查、`ruff` 与 `compileall` 全过。
 
-**打包验证**：本地按 `统一工具箱.spec` 用 PyInstaller 6.22.2 重新打包，`dist/统一工具箱.exe` 为 19.5 MB（CI 下限 10 MB），嵌入图标可正常提取；启动后主窗口标题为“统一工具箱 v3.10.5”，关闭并清理进程树后无残留。CI 的 `build` job 仍需在打 tag 或手动 `workflow_dispatch` 时跑一次，确认 GitHub 侧 artifact 上传。
+**打包验证**：本地按 `统一工具箱.spec` 用 PyInstaller 6.22.2 重新打包，`dist/统一工具箱.exe` 为 19.5 MB（CI 下限 10 MB），嵌入图标可正常提取；启动后主窗口标题为“统一工具箱 v3.10.6”，关闭并清理进程树后无残留。CI 的 `build` job 仍需在打 tag 或手动 `workflow_dispatch` 时跑一次，确认 GitHub 侧 artifact 上传。
+
+**发版验证**：v3.10.6 已发布到 GitHub 与 Gitee；发布后发现 Gitee 附件上传把 `.sha256` 也命名成 exe，已修正 `release.py` 并补回归测试，同时手工修复 v3.10.6 的 Gitee 附件（exe 19,495,526 字节 + `.sha256` 86 字节，下载哈希一致）。
