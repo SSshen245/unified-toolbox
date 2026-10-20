@@ -4,10 +4,10 @@
 
 **一款免安装的 Windows 桌面工具箱：硬件诊断、剪贴板增强、磁盘清理、软件卸载、文件洞察、快速启动 —— 全部装进一个 19MB 的 exe。**
 
-[![版本](https://img.shields.io/badge/版本-v3.8-blue)](../../releases)
+[![版本](https://img.shields.io/badge/版本-v3.10.6-blue)](../../releases)
 [![平台](https://img.shields.io/badge/平台-Windows%2010%2F11-lightgrey)](#-快速开始)
 [![运行时](https://img.shields.io/badge/运行时-Python%203.11-yellow)](#%EF%B8%8F-从源码运行开发)
-[![测试](https://img.shields.io/badge/测试-75%20通过-brightgreen)](#%EF%B8%8F-开发与测试)
+[![测试](https://img.shields.io/badge/测试-112%20通过-brightgreen)](#%EF%B8%8F-开发与测试)
 
 **[下载最新版](../../releases/latest)** · [功能一览](#-功能一览) · [使用说明](#-使用说明) · [从源码运行](#%EF%B8%8F-从源码运行开发)
 
@@ -47,7 +47,7 @@
 | ⚡ **快速启动** | 常用程序/文件夹/网址一键直达，双击启动 |
 | 🎛 **实用工具** | 系统悬浮窗、定时关机/重启、 magnifier 放大镜等日常小工具 |
 | 🧾 **新机验机** | 新机交付前的整体验收清单（配置/磁盘/驱动/激活/坏点/键盘），可导出报告 |
-| ⚙ **系统设置** | 主题（4 套实时切换）、开机自启、语言、关闭行为、定时任务、剪贴板隐私、更新源 |
+| ⚙ **系统设置** | 主题（4 套实时切换，不中断任务/不丢输入）、开机自启、语言、关闭行为、定时任务、剪贴板隐私、更新源 |
 
 <details>
 <summary>各页签截图</summary>
@@ -101,6 +101,8 @@ gitee:owner/repo                   Gitee（国内直连更快）
 ```
 
 - 有新版本时会提示下载，下载完成后**自动退出、替换自身并重启**
+- 下载包按 Release 附带的 `UnifiedToolbox.exe.sha256` 校验；新版若启动失败，
+  替换脚本会**自动恢复上一个版本**并在下次启动时提示，不会把程序更新坏
 - **GitHub 被限流时自动改查 Gitee 备用源**（每 IP 每小时只有 60 次匿名额度，
   国内家宽还是和陌生人共享的；限流提示里会写明几点恢复）
 - 查询结果缓存 10 分钟，重复点按钮不消耗额度
@@ -120,7 +122,7 @@ venv\Scripts\python.exe -m pip install -r requirements.txt
 :: 2. 直接跑源码（改完立即生效，不需要打包）
 venv\Scripts\python.exe unified\unified.py
 
-:: 3. 跑测试（75 项）
+:: 3. 跑测试（112 项）
 venv\Scripts\python.exe -m unittest discover -s tests
 
 :: 4. 打包 exe
@@ -138,14 +140,14 @@ venv\Scripts\python.exe -m unittest discover -s tests
 
 需要 `gh`（GitHub CLI）并已 `gh auth login`；不想到 GitHub 发布就加 `--no-publish`。
 
-> **注意**：`unified/unified.py` 里的 `APP_VERSION` 必须递增（`v3.7` → `v3.8`），
+> **注意**：`unified/unified.py` 里的 `APP_VERSION` 必须递增（`v3.10.6` → `v3.10.7`），
 > 否则老用户点「检查更新」会一直提示"已是最新版本"。
 
 ## 📁 项目结构
 
 ```
-unified/unified.py     全部应用代码（单文件，约 1.06 万行）
-tests/                 单元测试（75 项，AST/mock 级）+ 集成检查（6 项）
+unified/unified.py     全部应用代码（单文件，约 1.18 万行）
+tests/                 单元测试（112 项，AST/mock 级）+ 集成检查（7 项）
 docs/img/              截图
 release.py             一键发版逻辑（被 发版.cmd 调用）
 发版.cmd               双击入口：测试 → 提交 → 打 tag → 打包 → 发布

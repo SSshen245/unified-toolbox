@@ -52,8 +52,22 @@ class ClipboardTests(unittest.TestCase):
         self.cm._drain_captures()
         self.assertEqual(self.cm.history[0]["text"], "from hidden page")
         self.assertEqual(self.cm.history[0]["time"], stamp)
+        # 落盘改由 500ms 防抖任务完成（旧实现每捕获一条全量重写整个历史）。
+        # 测试里 root 是 Mock、没有事件循环，所以显式 flush；真实退出走 shutdown()。
+        self.assertTrue(self.cm._history_dirty)
+        self.assertTrue(self.cm._flush_history())
         persisted = json.loads(self.env["HISTORY_FILE"].read_text(encoding="utf-8"))
         self.assertEqual(persisted[0]["text"], "from hidden page")
+        self.assertFalse(self.cm._history_dirty)
+
+    def test_repeated_saves_reuse_one_pending_job(self):
+        self.cm._load_history()
+        self.cm._save_history()
+        job = self.cm._save_job
+        self.assertIsNotNone(job)
+        self.cm._save_history()
+        self.cm._save_history()
+        self.assertIs(self.cm._save_job, job)   # 连续变更只挂一个定时器
 
     def test_rebuild_keeps_history_and_single_service_state(self):
         self.cm._load_history()

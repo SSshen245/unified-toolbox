@@ -97,11 +97,11 @@ class LazyModulesTests(unittest.TestCase):
                        if isinstance(n, ast.FunctionDef) and n.name == "main")
         text = ast.get_source_segment(src, main_fn)
         self.assertIn("CreateMutexW", text)
-        # 实现已改为 OpenMutexW 探测（CreateMutexW 的返回码在 ctypes 下不可靠），
-        # 因此不再依赖 ERROR_ALREADY_EXISTS；真实行为由
-        # integration_checks.single_instance 实测覆盖。
-        self.assertIn("OpenMutexW", text)
-        probe = text.index("OpenMutexW(0x00100000")
+        # 单实例判定必须靠 CreateMutexW 的 ERROR_ALREADY_EXISTS：先 OpenMutexW
+        # 探测、再 CreateMutex 的写法在两个实例同时启动时会双双通过（TOCTOU）。
+        self.assertIn("ERROR_ALREADY_EXISTS", text)
+        self.assertIn("get_last_error", text)
+        probe = text.index("_acquire_mutex()")
         self.assertLess(probe, text.index("App(root)"),
                         "second-instance probe must run before App starts")
 

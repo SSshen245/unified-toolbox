@@ -43,6 +43,11 @@ class Scheduler:
         for callback in jobs.values():
             callback()
 
+    def winfo_exists(self):
+        if threading.get_ident() != self.owner:
+            raise AssertionError('Tk called from worker')
+        return True
+
 
 class Workers:
     def __init__(self):
@@ -50,6 +55,9 @@ class Workers:
 
     def Thread(self, target, daemon):
         return types.SimpleNamespace(start=lambda: self.jobs.append(target))
+
+    def Event(self):
+        return threading.Event()
 
     def run(self, index=0):
         self.jobs.pop(index)()
@@ -62,6 +70,13 @@ class Base:
 
 def load(name, **extra):
     node = next(n for n in TREE.body if isinstance(n, ast.ClassDef) and n.name == name)
+    # Shared module-level helpers live outside the class; compile them into the
+    # isolated namespace so tests exercise the real implementations.
+    helpers = [n for n in TREE.body
+               if ((isinstance(n, ast.ClassDef) and n.name == '_WorkerFailure')
+                   or (isinstance(n, ast.FunctionDef)
+                       and n.name in ('run_in_background', 'make_secondary_button',
+                                      'sort_treeview', 'parse_size')))]
     namespace = dict(BaseModule=Base, Path=Path, os=os, re=re, queue=queue,
                      ctypes=ctypes, tempfile=tempfile, threading=Workers(),
                      tk=Mock(), subprocess=Mock(), show_info=Mock(), show_warning=Mock(),
@@ -71,7 +86,8 @@ def load(name, **extra):
                                     'ORANGE', 'TEXT', 'TEXT2', 'MUTED', 'RED', 'YELLOW',
                                     'FONT_UI', 'FONT_MONO', 'BORDER')})
     namespace.update(extra)
-    exec(compile(ast.Module(body=[node], type_ignores=[]), '<isolated-candidate>', 'exec'), namespace)
+    exec(compile(ast.Module(body=helpers + [node], type_ignores=[]),
+                 '<isolated-candidate>', 'exec'), namespace)
     return namespace[name], namespace
 
 
@@ -363,6 +379,334 @@ class AppTests(unittest.TestCase):
         self.assertNotIn('pack_propagate(False)', switch)
         init = ast.get_source_segment(CANDIDATE, methods['__init__'])
         self.assertIn("root.protocol('WM_DELETE_WINDOW', self._hide_to_tray)", init)
+
+
+class PollerView:
+    """Minimal Tk stand-in: records after() callbacks and can be destroyed."""
+
+    def __init__(self):
+        self.jobs, self.alive = [], True
+
+    def after(self, delay, callback):
+        self.jobs.append(callback)
+        return len(self.jobs)
+
+    def winfo_exists(self):
+        return self.alive
+
+    def tick(self):
+        jobs, self.jobs = self.jobs, []
+        for callback in jobs:
+            callback()
+
+
+class PollerTests(unittest.TestCase):
+    """The shared queue+after skeleton must stay the only hand-rolled one."""
+
+    @staticmethod
+    def _poller():
+        workers = Workers()
+        ns = {'queue': queue, 'threading': workers}
+        nodes = [n for n in TREE.body
+                 if ((isinstance(n, ast.ClassDef) and n.name == '_WorkerFailure')
+                     or (isinstance(n, ast.FunctionDef) and n.name == 'run_in_background'))]
+        exec(compile(ast.Module(body=nodes, type_ignores=[]), '<poller>', 'exec'), ns)
+        return ns['run_in_background'], workers
+
+    def test_messages_arrive_in_order_and_loop_stops_itself(self):
+        spawn, workers = self._poller()
+        view, seen = PollerView(), []
+        def work(report):
+            report(1)
+            report(2)
+            report(3)
+        spawn(view, work, seen.append, interval=10)
+        self.assertEqual(len(view.jobs), 1)      # only the poll is scheduled
+        self.assertEqual(len(workers.jobs), 1)   # exactly one daemon worker
+        workers.run()
+        view.tick()
+        self.assertEqual(seen, [1, 2, 3])
+        self.assertEqual(view.jobs, [])          # drained + finished = no repoll
+
+    def test_stale_token_skips_delivery_and_scheduling(self):
+        spawn, workers = self._poller()
+        view, seen, ran = PollerView(), [], []
+        def work(report):
+            ran.append(True)
+            report('stale')
+        spawn(view, work, seen.append, interval=10, alive=lambda: False)
+        workers.run()
+        view.tick()
+        self.assertEqual(seen, [])
+        self.assertEqual(view.jobs, [])
+        self.assertEqual(ran, [True])
+
+    def test_destroyed_window_never_touches_handler(self):
+        spawn, workers = self._poller()
+        view, seen = PollerView(), []
+        view.alive = False
+        spawn(view, lambda report: report('late'), seen.append, interval=10)
+        workers.run()
+        view.tick()
+        self.assertEqual(seen, [])
+        self.assertEqual(view.jobs, [])
+
+    def test_worker_exception_is_delivered_on_ui_thread(self):
+        spawn, workers = self._poller()
+        view, seen, errors = PollerView(), [], []
+        def work(report):
+            report('before')
+            raise ValueError('boom')
+        spawn(view, work, seen.append, interval=10, on_error=errors.append)
+        workers.run()
+        view.tick()
+        self.assertEqual(seen, ['before'])
+        self.assertEqual([str(e) for e in errors], ['boom'])
+        self.assertEqual(view.jobs, [])
+
+    def test_handler_can_stop_early(self):
+        spawn, workers = self._poller()
+        view, seen = PollerView(), []
+        def handle(message):
+            seen.append(message)
+            return False
+        def work(report):
+            report(1)
+            report(2)
+        spawn(view, work, handle, interval=10)
+        workers.run()
+        view.tick()
+        self.assertEqual(seen, [1])
+        self.assertEqual(view.jobs, [])
+
+    def test_only_the_shared_helper_creates_a_poll_loop(self):
+        offenders = []
+        for node in ast.walk(TREE):
+            if not isinstance(node, ast.FunctionDef) or node.name == 'run_in_background':
+                continue
+            calls = set()
+            for child in ast.walk(node):
+                if (isinstance(child, ast.Call) and isinstance(child.func, ast.Attribute)
+                        and isinstance(child.func.value, ast.Name)):
+                    calls.add((child.func.value.id, child.func.attr))
+            has_queue = ('queue', 'Queue') in calls
+            has_get = any(attr == 'get_nowait' for _value, attr in calls)
+            if has_queue and has_get:
+                offenders.append(node.name)
+        self.assertEqual(offenders, [])
+
+
+class FakeButton:
+    def __init__(self, **options):
+        self.options = dict(options)
+        self.packed = None
+        self.bound = {}
+
+    def pack(self, **options):
+        self.packed = options
+
+    def bind(self, sequence, callback):
+        self.bound[sequence] = callback
+
+    def config(self, **options):
+        self.options.update(options)
+
+
+class FakeTk:
+    def __init__(self):
+        self.buttons = []
+
+    def Button(self, parent, **options):
+        button = FakeButton(**options)
+        button.parent = parent
+        self.buttons.append(button)
+        return button
+
+
+class FakeTree:
+    def __init__(self, rows):
+        self.values = {iid: dict(columns) for iid, columns in rows}
+        self.order = [iid for iid, _columns in rows]
+
+    def get_children(self):
+        return tuple(self.order)
+
+    def set(self, iid, column):
+        return self.values[iid][column]
+
+    def move(self, iid, parent, index):
+        self.order.remove(iid)
+        self.order.insert(index, iid)
+
+
+class WidgetFactoryTests(unittest.TestCase):
+    """Buttons and Treeview sorting share one implementation each."""
+
+    @staticmethod
+    def _helpers():
+        nodes = [n for n in TREE.body
+                 if isinstance(n, ast.FunctionDef)
+                 and n.name in ('make_secondary_button', 'sort_treeview')]
+        namespace = {'tk': FakeTk(), 'FONT_UI': 'Microsoft YaHei UI',
+                     'PANEL2': '#1b2230', 'PANEL3': '#232c3d',
+                     'CYAN': '#22d3ee'}
+        exec(compile(ast.Module(body=nodes, type_ignores=[]),
+                     '<widget-helpers>', 'exec'), namespace)
+        return namespace
+
+    def test_secondary_button_uses_shared_style(self):
+        make = self._helpers()['make_secondary_button']
+        clicked = []
+        button = make(object(), '扫描', lambda: clicked.append(True),
+                      color='#ff0000', font_size=10)
+        self.assertEqual(button.options['text'], '扫描')
+        self.assertEqual(button.options['bg'], '#1b2230')
+        self.assertEqual(button.options['fg'], '#ff0000')
+        self.assertEqual(button.options['font'], ('Microsoft YaHei UI', 10))
+        self.assertEqual(button.options['cursor'], 'hand2')
+        self.assertEqual(button.packed,
+                         {'side': 'left', 'padx': (0, 6), 'pady': 4})
+        button.bound['<Enter>'](None)
+        self.assertEqual(button.options['bg'], '#232c3d')
+        button.bound['<Leave>'](None)
+        self.assertEqual(button.options['bg'], '#1b2230')
+        button.options['command']()
+        self.assertEqual(clicked, [True])
+
+    def test_sort_treeview_orders_rows_without_rebuilding(self):
+        sort_treeview = self._helpers()['sort_treeview']
+        tree = FakeTree([('a', {'name': 'beta', 'size': '2'}),
+                         ('b', {'name': 'alpha', 'size': '1'}),
+                         ('c', {'name': 'gamma', 'size': '10'})])
+        sort_treeview(tree, 'name')
+        self.assertEqual(tree.get_children(), ('b', 'a', 'c'))
+        sort_treeview(tree, 'size', key=float, reverse=True)
+        self.assertEqual(tree.get_children(), ('c', 'a', 'b'))
+
+    def test_file_sort_parses_size_units(self):
+        cls, _ns = load('FileModule')
+        obj = object.__new__(cls)
+        obj.tree = FakeTree([('a', {'名称': 'a', '大小': '900.0M'}),
+                             ('b', {'名称': 'b', '大小': '1.2G'}),
+                             ('c', {'名称': 'c', '大小': '5.0K'})])
+        obj._sort('大小')
+        self.assertEqual(obj.tree.get_children(), ('b', 'a', 'c'))
+        obj._sort('名称')
+        self.assertEqual(obj.tree.get_children(), ('a', 'b', 'c'))
+
+    def test_process_sort_is_numeric_for_cpu_pid_memory(self):
+        cls, _ns = load('HardwareModule')
+        obj = object.__new__(cls)
+        rows = [('a', {'名称': 'a', 'CPU%': '9.5', 'PID': '9', '内存': '900.0M'}),
+                ('b', {'名称': 'b', 'CPU%': '10.5', 'PID': '100', '内存': '1.2G'}),
+                ('c', {'名称': 'c', 'CPU%': '2.0', 'PID': '20', '内存': '5.0K'})]
+        obj.procs_tree = FakeTree(rows)
+        obj._sort_procs('CPU%')
+        self.assertEqual(obj.procs_tree.get_children(), ('b', 'a', 'c'))
+        obj._sort_procs('PID')
+        self.assertEqual(obj.procs_tree.get_children(), ('b', 'c', 'a'))
+        obj._sort_procs('内存')
+        self.assertEqual(obj.procs_tree.get_children(), ('b', 'a', 'c'))
+        obj._sort_procs('名称')
+        self.assertEqual(obj.procs_tree.get_children(), ('a', 'b', 'c'))
+
+    def test_button_factories_delegate_to_the_shared_helper(self):
+        factories = [n for n in ast.walk(TREE)
+                     if isinstance(n, ast.FunctionDef)
+                     and n.name in ('_mkbtn', '_make_btn')]
+        self.assertTrue(factories)
+        for factory in factories:
+            calls = [c for c in ast.walk(factory) if isinstance(c, ast.Call)]
+            names = {c.func.id for c in calls if isinstance(c.func, ast.Name)}
+            self.assertIn('make_secondary_button', names,
+                          ast.get_source_segment(CANDIDATE, factory))
+            own_button = any(isinstance(c.func, ast.Attribute)
+                             and c.func.attr == 'Button' for c in calls)
+            self.assertFalse(own_button,
+                             'factory still builds its own tk.Button')
+
+    def test_only_shared_helper_moves_tree_rows(self):
+        offenders = []
+        for node in ast.walk(TREE):
+            if not isinstance(node, ast.FunctionDef) or node.name == 'sort_treeview':
+                continue
+            methods = {c.func.attr for c in ast.walk(node)
+                       if isinstance(c, ast.Call) and isinstance(c.func, ast.Attribute)}
+            if 'get_children' in methods and 'move' in methods:
+                offenders.append(node.name)
+        self.assertEqual(offenders, [])
+
+
+class ThemeTests(unittest.TestCase):
+    """Theme switching must repaint in place: a rebuild stops running work and
+    wipes search text, list data and scroll position."""
+
+    @staticmethod
+    def _function(name):
+        return next(n for n in TREE.body
+                    if isinstance(n, ast.FunctionDef) and n.name == name)
+
+    def test_color_map_only_covers_changed_values(self):
+        node = self._function('_theme_color_map')
+        keys = ('BG', 'PANEL', 'PANEL2', 'PANEL3', 'BORDER', 'CYAN', 'PURPLE',
+                'GREEN', 'YELLOW', 'RED', 'ORANGE', 'TEXT', 'TEXT2', 'MUTED')
+        namespace = {'_THEME_KEYS': keys}
+        exec(compile(ast.Module(body=[node], type_ignores=[]),
+                     '<theme-map>', 'exec'), namespace)
+        mapping = namespace['_theme_color_map']
+        old = {k: '#000000' for k in keys}
+        new = {k: '#000000' for k in keys}
+        old['BG'], new['BG'] = '#0d1117', '#f5f7fa'
+        old['CYAN'], new['CYAN'] = '#0089e9', '#a78bfa'
+        self.assertEqual(mapping(old, new),
+                         {'#0d1117': '#f5f7fa', '#0089e9': '#a78bfa'})
+        self.assertEqual(mapping(old, old), {})
+
+    def test_apply_theme_live_never_destroys_or_rebuilds_page(self):
+        app = next(n for n in TREE.body
+                   if isinstance(n, ast.ClassDef) and n.name == 'App')
+        fn = next(n for n in app.body
+                  if isinstance(n, ast.FunctionDef) and n.name == '_apply_theme_live')
+        source = ast.get_source_segment(CANDIDATE, fn)
+
+        # Calls reachable without entering an except handler: these run on the
+        # happy path, so none of them may tear the page or settings window down.
+        def happy_path_calls(nodes):
+            names, stack = [], list(nodes)
+            while stack:
+                node = stack.pop()
+                if isinstance(node, ast.Call):
+                    func = node.func
+                    if isinstance(func, ast.Attribute):
+                        names.append(func.attr)
+                    elif isinstance(func, ast.Name):
+                        names.append(func.id)
+                for child in ast.iter_child_nodes(node):
+                    if not isinstance(child, ast.ExceptHandler):
+                        stack.append(child)
+            return names
+
+        calls = happy_path_calls(fn.body)
+        self.assertNotIn('_switch', calls)
+        self.assertNotIn('destroy', calls)
+        self.assertIn('recolor_widget_tree', calls)
+        # 预览色块必须在整体重涂之后重画，否则当前主题那块会被染成新主题
+        self.assertLess(source.index('recolor_widget_tree'),
+                        source.index('_paint_theme_chip'))
+
+    def test_cancel_previews_restores_theme_then_closes_window(self):
+        app = next(n for n in TREE.body
+                   if isinstance(n, ast.ClassDef) and n.name == 'App')
+        fn = next(n for n in app.body
+                  if isinstance(n, ast.FunctionDef) and n.name == 'show_settings')
+        source = ast.get_source_segment(CANDIDATE, fn)
+        start = source.index('def cancel():')
+        body = source[start:source.index('tk.Button(btns', start)]
+        self.assertIn('theme_var.set(saved_theme)', body)
+        self.assertLess(body.index('_apply_theme_live(saved_theme)'),
+                        body.index('win.destroy()'))
+        # 旧写法靠重建窗口收尾，会直接 return，窗口留在屏幕上
+        self.assertNotIn('return          #', body)
 
 
 if __name__ == '__main__':

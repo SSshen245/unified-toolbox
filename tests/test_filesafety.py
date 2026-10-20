@@ -11,6 +11,7 @@ import stat
 import sys
 import tempfile
 import textwrap
+import threading
 import types
 import unittest
 from unittest.mock import Mock, patch
@@ -21,12 +22,21 @@ SOURCE = repair.SOURCE.read_text(encoding='utf-8')
 CANDIDATE = SOURCE  # repairs are applied to the live source; tests exercise it
 
 
+def add_poller(ns):
+    """Compile the module-level UI poller into an isolated test namespace."""
+    nodes = [n for n in ast.parse(CANDIDATE).body
+             if ((isinstance(n, ast.ClassDef) and n.name == '_WorkerFailure')
+                 or (isinstance(n, ast.FunctionDef) and n.name == 'run_in_background'))]
+    exec(compile(ast.Module(body=nodes, type_ignores=[]), '<poller>', 'exec'), ns)
+
+
 def extracted_class(name):
     node = next(n for n in ast.parse(CANDIDATE).body if isinstance(n, ast.ClassDef) and n.name == name)
     methods = [n for n in node.body if isinstance(n, ast.FunctionDef)]
     cls = ast.ClassDef(name=name, bases=[], keywords=[], body=methods, decorator_list=[])
     ns = dict(os=os, Path=Path, re=re, fnmatch=fnmatch, datetime=datetime, queue=queue,
               CYAN='', PURPLE='', GREEN='', YELLOW='', RED='', TEXT2='')
+    add_poller(ns)
     exec(compile(ast.fix_missing_locations(ast.Module(body=[cls], type_ignores=[])), '<methods>', 'exec'), ns)
     return ns[name], ns
 
@@ -62,6 +72,9 @@ class Threads:
 
     def Thread(self, target, daemon=True):
         return types.SimpleNamespace(start=lambda: self.jobs.append(target))
+
+    def Event(self):
+        return threading.Event()
 
     def run(self, index=0):
         self.jobs.pop(index)()
@@ -108,6 +121,7 @@ class AsyncTests(unittest.TestCase):
         obj = types.SimpleNamespace(_scan_residuals=Mock(side_effect=ValueError('mock failure')))
         ns = dict(self=obj, top=top, status=status, threading=threads, queue=queue,
                   app_={'name': 'Example App'}, scan_state={'token': None}, _fill=Mock())
+        add_poller(ns)
         nested('_residual_dialog', {'_do_scan'}, ns)
         ns['_do_scan']()
         self.assertEqual(obj._scan_residuals.call_count, 0)
@@ -133,6 +147,7 @@ class AsyncTests(unittest.TestCase):
         ns = dict(top=top, status=status, threading=threads, queue=queue, q=queue.Queue(),
                   querying={'running': False}, subprocess=subprocess, tree=tree, iid_id={},
                   parse_winget_upgrades=lambda out: [])
+        add_poller(ns)
         nested('_upgrade_dialog', {'_query', '_poll'}, ns)
         for fail in (False, True, False):
             subprocess.run.side_effect = RuntimeError('mock query error') if fail else None

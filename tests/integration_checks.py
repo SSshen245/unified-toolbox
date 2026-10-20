@@ -2,7 +2,8 @@
 
 Run: venv\\Scripts\\python.exe tests\\integration_checks.py
 Covers lazy module loading, single-instance mutex, page switching, clipboard
-capture persistence and OCR. No destructive system operations.
+capture persistence, OCR, dialog layout, window state and theme switching.
+No destructive system operations.
 """
 import ctypes
 import importlib.util
@@ -61,13 +62,27 @@ def isolate(module, folder):
     return folder
 
 
+def new_root():
+    """Create a Tk root and make it the default root.
+
+    App code creates StringVar/OptionMenu without an explicit master, so tkinter
+    binds them to tk._default_root. A previous check can leave a stale default
+    pointing at a destroyed interpreter, and then a settings radio would set
+    PY_VAR3 in the new interpreter while its cancel handler reads PY_VAR3 from
+    the dead one. Production has exactly one root; this only normalizes checks.
+    """
+    root = tk.Tk()
+    tk._default_root = root
+    return root
+
+
 def lazy_loading():
     module = load_module()
     module.App._setup_tray_and_hotkey = lambda self: None
     module.enable_dark_title_bar = lambda window: None
     with tempfile.TemporaryDirectory() as folder:
         isolate(module, folder)
-        root = tk.Tk()
+        root = new_root()
         root.withdraw()
         errors = []
         root.report_callback_exception = lambda *a: errors.append(repr(a[1]))
@@ -136,7 +151,7 @@ def clipboard_switch():
         sample = ["initial"]
         module.clip_get_text = lambda: sample[0]
         module.clip_get_dib = lambda: None
-        root = tk.Tk()
+        root = new_root()
         root.withdraw()
         errors = []
         root.report_callback_exception = lambda *a: errors.append(repr(a[1]))
@@ -203,7 +218,7 @@ def dialog_layout():
     # 不把 App 的落盘路径留在用户真实配置上：_quit_app -> _save_geometry ->
     # save_settings() 会直接把 ~/.unified_toolbox_settings.json 覆写成默认值
     isolate(module, tempfile.mkdtemp(prefix="utb_check_"))
-    root = tk.Tk()
+    root = new_root()
     root.geometry("1100x900+40+20")
     app = module.App(root)
     root.update()
@@ -304,7 +319,7 @@ def window_state():
             "geometry": "1100x906+439+0", "maximized": True, "start_maximized": False,
         }), encoding="utf-8")
         module.load_settings()
-        root = tk.Tk()
+        root = new_root()
         root.geometry("1100x900")
         app = module.App(root)
         for _ in range(12):
@@ -319,6 +334,99 @@ def window_state():
         return (f"reopened {state}; windowed geometry kept as {saved['geometry']}")
 
 
+def theme_switch():
+    """Theme preview repaints in place: page, search text and settings stay put.
+
+    The old implementation called _switch(), which stops every module, destroys
+    the page and rebuilds it — killing scans/installs and clearing search boxes
+    (UninstallModule/ClipboardModule even create a fresh StringVar in build()).
+    """
+    module = load_module()
+    module.App._setup_tray_and_hotkey = lambda self: None
+    module.enable_dark_title_bar = lambda window: None
+    with tempfile.TemporaryDirectory() as folder:
+        isolate(module, folder)
+        root = new_root()
+        root.withdraw()
+        errors = []
+        root.report_callback_exception = lambda *a: errors.append(repr(a[1]))
+        app = module.App(root)
+        root.withdraw()
+        app._switch("clipboard")
+        root.update()
+        page = app.current
+        cm = app.module("clipboard")
+        cm.search_var.set("keep-me")
+        inner, canvas = app._inner, app._canvas
+        saved_theme = module.THEME_NAME
+        target = next(k for k in module.THEMES if k != saved_theme)
+
+        def walk(w):
+            for child in w.winfo_children():
+                yield child
+                yield from walk(child)
+
+        app.show_settings()
+        win = app._settings_win
+        root.update()
+        radio = next(w for w in walk(win)
+                     if w.winfo_class() == "Radiobutton"
+                     and str(w.cget("value")) == target)
+        radio.invoke()
+        root.update()
+        assert module.THEME_NAME == target, module.THEME_NAME
+        assert app.current is page, "page module replaced"
+        assert app._inner is inner and app._canvas is canvas, "page rebuilt"
+        assert cm.search_var.get() == "keep-me", "search text lost"
+        assert app._settings_win is win and win.winfo_exists(), "settings closed"
+        want = module.THEMES[target].BG.lower()
+        assert inner.cget("bg").lower() == want, (inner.cget("bg"), want)
+        assert win.cget("bg").lower() == want, win.cget("bg")
+        # 主题预览块必须保留各自的调色板，不能被"旧→新"映射染成新主题
+        old_chip = next(w for w in walk(win)
+                        if w.winfo_class() == "Radiobutton"
+                        and str(w.cget("value")) == saved_theme)
+        chip_bg = module.THEMES[saved_theme].BG.lower()
+        assert old_chip.master.cget("bg").lower() == chip_bg, \
+            old_chip.master.cget("bg")
+
+        cancel = next(w for w in walk(win)
+                      if w.winfo_class() == "Button"
+                      and "取消" in str(w.cget("text")))
+        cancel.invoke()
+        root.update()
+        assert module.THEME_NAME == saved_theme, module.THEME_NAME
+        assert not win.winfo_exists(), "cancel left the settings window open"
+        assert app._inner is inner and cm.search_var.get() == "keep-me"
+
+        # 自定义配色被替换后再次应用：必须按"当前真正显示的颜色"重涂，而不是
+        # 读已被覆盖的 THEMES["custom"]（否则旧→新映射为空，整页保持旧色）。
+        saved_custom = module.THEMES.get("custom")
+        first = module.Palette.from_mapping(
+            dict(module.ACTIVE_PALETTE.as_dict(), BG="#010203"))
+        module.THEMES["custom"] = first
+        app._apply_theme_live("custom")
+        root.update()
+        assert app._inner.cget("bg").lower() == "#010203", app._inner.cget("bg")
+        second = module.Palette.from_mapping(
+            dict(first.as_dict(), BG="#0a0b0c"))
+        module.THEMES["custom"] = second
+        app._apply_theme_live("custom")
+        root.update()
+        assert app._inner.cget("bg").lower() == "#0a0b0c", app._inner.cget("bg")
+        if saved_custom is None:
+            module.THEMES.pop("custom", None)
+        else:
+            module.THEMES["custom"] = saved_custom
+        app._apply_theme_live(saved_theme)
+        root.update()
+
+        app._quit_app()
+        assert not errors, errors
+        return (f"{saved_theme} -> {target} -> {saved_theme}; "
+                "page, search text and settings window preserved")
+
+
 def main():
     check("lazy module loading", lazy_loading)
     check("single instance mutex", single_instance)
@@ -326,6 +434,7 @@ def main():
     check("OCR recognition", ocr_recognition)
     check("dialog layout keeps buttons reachable", dialog_layout)
     check("window state survives restart", window_state)
+    check("theme switch keeps page state", theme_switch)
     failed = [name for name, ok, _ in results if not ok]
     print("\nSUMMARY:", f"{len(results) - len(failed)}/{len(results)} passed")
     if failed:

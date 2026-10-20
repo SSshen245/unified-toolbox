@@ -5,7 +5,7 @@ a = Analysis(
     ['unified/unified.py'],
     pathex=[],
     binaries=[],
-    datas=[],
+    datas=[('icons/doctor.ico', 'icons')],
     hiddenimports=['pystray', 'pystray._win32', 'PIL.Image', 'PIL.ImageDraw'],
     hookspath=[],
     hooksconfig={},

@@ -6,8 +6,10 @@ normal `unittest discover -s tests` sweep.
 import importlib.util
 import os
 import re
+import subprocess
 import tempfile
 import unittest
+from dataclasses import FrozenInstanceError
 from pathlib import Path
 from unittest.mock import patch
 
@@ -353,10 +355,10 @@ class UpdateCheckTests(unittest.TestCase):
 
     def test_swapper_path_is_unique(self):
         """cmd.exe reads a .cmd incrementally while running it, and the previous
-        swapper is still alive for ~8 s (tail insurance). Reusing one fixed name
-        let a new update overwrite the file under the old cmd's feet — both then
-        jumped to a bogus byte offset, and the new version silently never
-        started. Every run must get its own file."""
+        swapper stays alive much longer now (health check up to 60 s). Reusing
+        one fixed name let a new update overwrite the file under the old cmd's
+        feet — both then jumped to a bogus byte offset, and the new version
+        silently never started. Every run must get its own file."""
         a = MODULE.write_update_swapper()
         b = MODULE.write_update_swapper()
         try:
@@ -449,6 +451,77 @@ class UpdateCheckTests(unittest.TestCase):
             self.assertIn("gitee:owner/repo", err or "")
 
 
+class UpdateSwapperRollbackTests(unittest.TestCase):
+    """A failed self-update must not brick the app: back up, replace atomically,
+    and restore the previous exe when the new build never reports healthy."""
+
+    def test_swapper_text_has_backup_atomic_move_and_rollback(self):
+        text = MODULE._UPDATE_SWAPPER
+        self.assertIn('copy /y "%~2" "%~2.old"', text)
+        self.assertIn('move /y "%~2.new" "%~2"', text)
+        self.assertIn('"%TEMP%\\' + MODULE._UPDATE_OK_FLAG + '"', text)
+        self.assertIn('"%TEMP%\\' + MODULE._UPDATE_ERROR_FILE + '"', text)
+        self.assertIn("copy /y \"%~2.old\" \"%~2\"", text)
+        self.assertIn("rollback", text)
+
+    def _run_swapper(self, new_healthy):
+        """Run the real cmd against dummy files with an isolated %TEMP%.
+
+        UTB_UPDATE_SWAPPER_TEST makes the script skip `start` (dummy files are
+        not runnable) and shortens the health window to one second.
+        """
+        with tempfile.TemporaryDirectory() as folder:
+            base = Path(folder)
+            target = base / "app.exe"
+            target.write_bytes(b"OLD-BUILD")
+            new = base / "new.exe"
+            new.write_bytes(b"NEW-BUILD")
+            tmp = base / "tmp"
+            tmp.mkdir()
+            if new_healthy:
+                (tmp / MODULE._UPDATE_OK_FLAG).write_text("ok", encoding="ascii")
+            script = base / "swap.cmd"
+            script.write_bytes(MODULE._UPDATE_SWAPPER.replace("\n", "\r\n")
+                               .encode("ascii"))
+            env = dict(os.environ, TEMP=str(tmp), TMP=str(tmp),
+                       UTB_UPDATE_SWAPPER_TEST="1")
+            proc = subprocess.run(["cmd", "/c", str(script), str(new), str(target)],
+                                  env=env, capture_output=True, text=True, timeout=60)
+            error = (tmp / MODULE._UPDATE_ERROR_FILE)
+            return {
+                "rc": proc.returncode,
+                "target": target.read_bytes(),
+                "new_left": new.exists(),
+                "old_left": (base / "app.exe.old").exists(),
+                "new_part_left": (base / "app.exe.new").exists(),
+                "ok_left": (tmp / MODULE._UPDATE_OK_FLAG).exists(),
+                "after_left": (tmp / MODULE._UPDATE_FLAG_NAME).exists(),
+                "error": error.read_text(encoding="utf-8", errors="replace")
+                          if error.exists() else "",
+            }
+
+    def test_new_build_that_never_reports_healthy_is_rolled_back(self):
+        out = self._run_swapper(new_healthy=False)
+        self.assertEqual(out["rc"], 0)
+        self.assertEqual(out["target"], b"OLD-BUILD")
+        self.assertFalse(out["new_left"])
+        self.assertFalse(out["old_left"])
+        self.assertFalse(out["new_part_left"])
+        self.assertFalse(out["after_left"],
+                         "the restored instance must not think it is post-update")
+        self.assertIn("rollback", out["error"])
+
+    def test_healthy_new_build_replaces_and_cleans_backup(self):
+        out = self._run_swapper(new_healthy=True)
+        self.assertEqual(out["rc"], 0)
+        self.assertEqual(out["target"], b"NEW-BUILD")
+        self.assertFalse(out["new_left"])
+        self.assertFalse(out["old_left"])
+        self.assertFalse(out["new_part_left"])
+        self.assertFalse(out["ok_left"], "the marker must be consumed")
+        self.assertEqual(out["error"], "")
+
+
 class SettingsDefaultsTests(unittest.TestCase):
     def test_every_settings_key_used_in_code_is_registered(self):
         """Keys missing from DEFAULT_SETTINGS are silently dropped by load_settings,
@@ -478,6 +551,178 @@ class SettingsDefaultsTests(unittest.TestCase):
                 used.add(node.args[0].value)
         self.assertEqual(sorted(used - defaults), [],
                          "these SETTINGS keys would be dropped on restart")
+
+
+class ThemePaletteTests(unittest.TestCase):
+    """Theme definitions are immutable Palette objects. apply_theme only exports
+    aliases; it must never mutate the palette a caller captured earlier."""
+
+    def setUp(self):
+        self.saved_theme = MODULE.THEME_NAME
+        self.saved_custom = MODULE.THEMES.get("custom")
+
+    def tearDown(self):
+        if self.saved_custom is None:
+            MODULE.THEMES.pop("custom", None)
+        else:
+            MODULE.THEMES["custom"] = self.saved_custom
+        MODULE.apply_theme(self.saved_theme)
+
+    def test_builtin_palettes_are_complete_and_frozen(self):
+        builtins = {"blue", "purple", "emerald", "light"}
+        self.assertTrue(builtins <= set(MODULE.THEMES))
+        for key in builtins:
+            palette = MODULE.THEMES[key]
+            self.assertIsInstance(palette, MODULE.Palette)
+            exported = palette.as_globals()
+            self.assertEqual(tuple(exported), MODULE._THEME_KEYS)
+            for name, color in exported.items():
+                self.assertRegex(color, r"^#[0-9a-fA-F]{6}$", f"{key}.{name}")
+            self.assertIsInstance(palette.dark, bool)
+            self.assertEqual(len(palette.STRIP), 2)
+            self.assertEqual(palette.as_dict()["BG"], palette.BG)
+        with self.assertRaises(FrozenInstanceError):
+            MODULE.THEMES["blue"].BG = "#000000"
+
+    def test_apply_theme_exports_aliases_without_mutating_palettes(self):
+        blue = MODULE.THEMES["blue"]
+        before = blue.as_dict()
+        palette = MODULE.apply_theme("purple")
+        self.assertIs(palette, MODULE.THEMES["purple"])
+        self.assertIs(MODULE.ACTIVE_PALETTE, palette)
+        self.assertEqual(MODULE.THEME_NAME, "purple")
+        self.assertTrue(MODULE.THEME_IS_DARK)
+        for key in MODULE._THEME_KEYS:
+            self.assertEqual(getattr(MODULE, key), getattr(palette, key))
+        self.assertEqual((MODULE.BG_R, MODULE.BG_G, MODULE.BG_B),
+                         tuple(int(palette.BG[i:i + 2], 16) for i in (1, 3, 5)))
+        self.assertEqual(blue.as_dict(), before)
+        MODULE.apply_theme("light")
+        self.assertFalse(MODULE.THEME_IS_DARK)
+        self.assertEqual(MODULE.BG, MODULE.THEMES["light"].BG)
+        self.assertIs(MODULE.ACTIVE_PALETTE, MODULE.THEMES["light"])
+
+    def test_active_palette_tracks_applied_object_not_dict_entry(self):
+        """A custom palette can be replaced in THEMES while the old one is still
+        displayed; switching to it again must have the true old colors to map."""
+        MODULE.apply_theme("blue")
+        active = MODULE.ACTIVE_PALETTE
+        data = MODULE.THEMES["blue"].as_dict()
+        data["BG"] = "#010203"
+        replacement = MODULE.Palette.from_mapping(data)
+        MODULE.THEMES["custom"] = replacement
+        # Installing a new dict entry must not silently change what is displayed.
+        self.assertIs(MODULE.ACTIVE_PALETTE, active)
+        self.assertEqual(MODULE.BG, active.BG)
+        applied = MODULE.apply_theme("custom")
+        self.assertIs(applied, replacement)
+        self.assertIs(MODULE.ACTIVE_PALETTE, replacement)
+        self.assertEqual(MODULE.BG, "#010203")
+
+    def test_unknown_theme_falls_back_to_blue(self):
+        palette = MODULE.apply_theme("does-not-exist")
+        self.assertIs(palette, MODULE.THEMES["blue"])
+        self.assertEqual(MODULE.THEME_NAME, "blue")
+
+    def test_from_mapping_validates_and_normalizes_custom_files(self):
+        data = MODULE.THEMES["blue"].as_dict()
+        self.assertEqual(MODULE.Palette.from_mapping(data), MODULE.THEMES["blue"])
+        broken = dict(data)
+        broken.pop("CYAN")
+        with self.assertRaises(ValueError):
+            MODULE.Palette.from_mapping(broken)
+        wrong_type = dict(data)
+        wrong_type["GREEN"] = 123
+        with self.assertRaises(ValueError):
+            MODULE.Palette.from_mapping(wrong_type)
+        # JSON turns the STRIP tuple into a list; import must still accept it.
+        json_like = dict(data)
+        json_like["STRIP"] = ["#111111", "#222222"]
+        json_like["label"] = None
+        custom = MODULE.Palette.from_mapping(json_like)
+        self.assertEqual(custom.STRIP, ("#111111", "#222222"))
+        self.assertEqual(custom.label, "🎨 自定义")
+        # Malformed STRIP falls back to CYAN/BORDER instead of breaking the UI.
+        bad_strip = dict(data)
+        bad_strip["STRIP"] = ["#111111"]
+        self.assertEqual(MODULE.Palette.from_mapping(bad_strip).STRIP,
+                         (data["CYAN"], data["BORDER"]))
+
+
+class UpdateHashVerificationTests(unittest.TestCase):
+    """更新包校验：Release 带 <exe>.sha256 时下载后必须比对哈希。"""
+
+    class _FakeHTTP:
+        def __init__(self, payload):
+            self._payload = payload
+            self.headers = {"Content-Length": str(len(payload))}
+
+        def read(self, n=-1):
+            if n is None or n < 0:
+                chunk, self._payload = self._payload, b""
+            else:
+                chunk, self._payload = self._payload[:n], self._payload[n:]
+            return chunk
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+    def test_sidecar_sha_is_picked_up(self):
+        import hashlib
+        import json
+        digest = hashlib.sha256(b"payload").hexdigest()
+        release = {
+            "tag_name": "v9.9.9",
+            "assets": [
+                {"name": "UnifiedToolbox.exe",
+                 "browser_download_url": "https://example.invalid/UnifiedToolbox.exe"},
+                {"name": "UnifiedToolbox.exe.sha256",
+                 "browser_download_url": "https://example.invalid/UnifiedToolbox.exe.sha256"},
+            ],
+        }
+
+        def fake_urlopen(req, timeout=None):
+            url = getattr(req, "full_url", str(req))
+            if url.endswith(".sha256"):
+                body = ("%s  UnifiedToolbox.exe\n" % digest).encode("ascii")
+            else:
+                body = json.dumps(release).encode("utf-8")
+            resp = self._FakeHTTP(body)
+            resp.headers = {"Content-Length": str(len(body))}
+            return resp
+
+        with patch.object(MODULE.urllib.request, "urlopen", side_effect=fake_urlopen):
+            tag, url, name, err = MODULE.fetch_latest_release("owner/repo", use_cache=False)
+        self.assertIsNone(err)
+        self.assertEqual(tag, "v9.9.9")
+        self.assertEqual(MODULE._LAST_RELEASE_SHA, digest)
+
+    def test_matching_sha_keeps_file(self):
+        import hashlib
+        payload = b"MZ" + b"x" * 5000
+        digest = hashlib.sha256(payload).hexdigest()
+        with tempfile.TemporaryDirectory() as folder:
+            dest = Path(folder) / "update.exe"
+            with patch.object(MODULE.urllib.request, "urlopen",
+                              side_effect=lambda *a, **k: self._FakeHTTP(payload)):
+                err = MODULE.download_update("https://example.invalid/x", str(dest),
+                                             timeout=10, expect_sha=digest)
+            self.assertEqual(err, "")
+            self.assertEqual(dest.read_bytes(), payload)
+
+    def test_mismatched_sha_deletes_file(self):
+        payload = b"MZ" + b"x" * 5000
+        with tempfile.TemporaryDirectory() as folder:
+            dest = Path(folder) / "update.exe"
+            with patch.object(MODULE.urllib.request, "urlopen",
+                              side_effect=lambda *a, **k: self._FakeHTTP(payload)):
+                err = MODULE.download_update("https://example.invalid/x", str(dest),
+                                             timeout=10, expect_sha="0" * 64)
+            self.assertIn("校验失败", err)
+            self.assertFalse(dest.exists())
 
 
 if __name__ == "__main__":

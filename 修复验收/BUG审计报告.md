@@ -59,7 +59,7 @@
 
 **9. 设置中心「取消」无法还原主题预览**（`show_settings`）
 `_apply_theme_live` 会销毁并重建设置窗口，新窗口的 `saved_theme = THEME_NAME` 已经等于刚预览的主题，于是 `theme_var.get() != saved_theme` 恒为假，取消成了空操作（界面文案却承诺"取消还原原主题"）。
-**修法**：把"打开设置时的主题"挂到 App 实例（`_settings_theme_at_open`）跨重建保存；save/cancel 时清空；`cancel` 里 `_apply_theme_live` 之后直接 `return`（旧代码紧接着还对已销毁的窗口调 `win.destroy()`，本身就会抛 TclError）；点 X 也绑成 cancel。
+**修法**：把"打开设置时的主题"挂到 App 实例（`_settings_theme_at_open`）跨窗口保存；save/cancel 时清空；点 X 也绑成 cancel。（后来主题切换改为就地重着色、不再重建窗口，`cancel` 在还原主题后直接关窗；见第 20 条。）
 实测：打开(blue) → 预览(purple) → 取消 → 确实回到 blue。
 
 **10. 快速面板对图片条目粘贴的是字面文字**（`App._qp_paste`）
@@ -128,3 +128,45 @@
 | `dist\统一工具箱.exe` | 已 `--clean` 全新建（构建前后源码 MD5 一致），启动正常 |
 
 新增回归测试**专门把 P0 的误伤路径固化成断言**：`test_undo_record_is_names_only_so_callers_must_pin_the_folder` 用真实文件复现"撤销会被误用到别的目录"，防止回退。
+
+## 五、后续补修
+
+**20. 切换主题会中断任务并丢掉页面状态**（`App._apply_theme_live`）
+旧实现是 `apply_theme → _setup_ttk_style → _switch(当前页)`：`_switch` 先 `stop()` 全部模块，再销毁、重建当前页。正在跑的扫描 / 安装 / 卸载会被掐断；搜索框（`UninstallModule`、`ClipboardModule` 的 `StringVar` 在 `build()` 里重新创建）、列表数据和滚动位置全部清零；设置窗口也要关掉重开，未保存的选项随之丢失。
+**修法**：改为**就地重着色**——按"旧主题色值 → 新主题色值"递归改写现有控件（tk 选项 / Canvas 图元 / Treeview 标签 / Text 标签 / Listbox 项），再补顶部骨架、状态栏和主题预览块；不再调用 `_switch`，也不销毁设置窗口。只有重涂抛异常时才退回重建兜底；「取消」改为还原主题后直接关窗。
+实测：`blue → purple → blue` 全程页面对象、搜索框内容和设置窗口保持不变，控件背景正确切到新主题色；集成检查 7/7 通过。
+
+**21. 20+ 处手写 `queue + after` 轮询各写各的**（跨线程 UI 更新）
+每处后台任务都复制一遍「`queue.Queue()` → worker 里 `put` → 主线程 `get_nowait` → `queue.Empty` 时 `after` 续排」。模板重复本身只是啰嗦，真正的风险是复制时漏掉守卫或停止条件：有的没检查窗口是否已销毁，有的 worker 抛异常后永远卡在「查询中…」，有的把两个操作塞进同一个队列导致 `(ok, msg)` 被当成 `(pts, total)` 解包。
+**修法**：新增模块级 `run_in_background(widget, work, handle, interval=200, alive=None, on_error=None)`，把骨架收成一处：
+- `work(report)` 在 daemon 线程跑，可多次 `report()` 进度 / 日志 / 最终结果；
+- `handle(message)` 在主线程按序执行，返回 False 可提前停止；
+- 完成标记与结果走**同一个 FIFO 队列**，杜绝「刚判空、worker 又放入结果」的丢消息竞态；
+- 统一 `winfo_exists` / `alive()` 守卫，关窗、切页或扫描 token 被替换即停；
+- worker 异常默认交 Tk `report_callback_exception`，与回调里直接抛异常一致，不会静默挂死。
+共迁移 30 处后台任务调用（硬件报告、端口查询、OCR、清理/扫描、软件更新与安装、UWP、还原点、激活、驱动检查、检查更新等）。`HardwareModule._run_in_queue`、`UninstallModule._icon_q`、剪贴板采集、托盘事件等**常驻服务循环**按设计保留——它们是长期消费者，不是一次性任务。
+**回归测试**：新增 `PollerTests` 6 项（顺序投递、自动停止、token 过期、窗口销毁、异常转交、提前停止），并加一条 AST 断言：除 `run_in_background` 外，任何函数都不得再同时出现 `queue.Queue()` 与 `get_nowait()`。
+实测：101 项单元测试、7 项集成检查、`ruff` 与 `compileall` 全过。
+
+**22. 6 套按钮工厂各抄一份、Treeview 排序各写一遍**
+`BaseModule`、`CleanupModule`、`UninstallModule`、`FileModule`、`LaunchModule` 各有一个 `_mkbtn`，`HardwareModule` 还有一个从未被调用的 `_make_btn`。细节已经漂移：字号 9 / 10 混用、`pady` 3 / 4 混用，返回不返回按钮也不一致。排序同样复制了「取 `get_children` → `sort` → 逐行 `move`」，文件页和进程页各一份；改一处排序规则很容易漏掉另一处。
+**修法**：新增模块级 `make_secondary_button(...)` 与 `sort_treeview(tree, column, key=None, reverse=False)`：
+- 各模块的 `_mkbtn` 只保留自己的默认字号 / 颜色 / 边距，主体统一调用 `make_secondary_button`；`_mkbtn` 的返回值契约保持不变（`UninstallModule` 等依赖返回按钮的调用点不受影响）；
+- 文件页按 `parse_size` 排「大小」，进程页按数值排 `CPU%` / `PID` / `内存`、其余按文本升序，全部走同一个 `sort_treeview`；行仍然用 `tree.move` 原地挪动，选中、tag 和滚动位置都不丢；
+- 删除无调用点的 `HardwareModule._make_btn`。
+- 卸载页的「名称 / 大小 / 安装时间…」排序是数据层重排后重建列表（`_sorted_apps`），不涉及逐行 `move`，保留原逻辑。
+**回归测试**：新增 `WidgetFactoryTests` 6 项（按钮样式与悬停、文本/数值排序、文件大小单位、进程三列数值排序、两个 AST 去重断言）。
+实测：107 项单元测试、7 项集成检查、`ruff` 与 `compileall` 全过。
+
+**23. 主题配色是裸字典 + `globals()` 注入，字段拼错只能等运行时**
+`THEMES` 用 `dict[str, dict]` 存 `label` / `dark` / 14 个颜色 / `STRIP`，`apply_theme` 用 `globals()[k] = t[k]` 写模块常量。颜色名拼错、缺字段、`STRIP` 不是二元组，都要等切主题时才暴露；自定义配色导入只检查 key 是否存在，不检查值类型。
+**修法**：把每套配色改为不可变 `Palette` 数据类（`frozen=True, kw_only=True`）：
+- 14 个颜色字段 + `label` / `dark` / `STRIP` 在构造时即校验，字段缺失或拼错直接 `TypeError`；
+- `as_globals()` 只导出颜色别名，`apply_theme` 仍是唯一写入点；全文件 1.18 万行继续按 `CYAN/PANEL` 裸常量读取，避免上千处改成 `THEMES[...].X` 的大范围风险（这是刻意保留的兼容层，不是漏改）；
+- 新增 `ACTIVE_PALETTE` 记录真正显示中的调色板；自定义配色文件被替换后再次应用时，旧色映射不会因为 `THEMES["custom"]` 已被覆盖而变成空映射；
+- `as_dict()` / `from_mapping()` 负责自定义配色文件与导出 JSON 的往返；导入时校验缺字段、非字符串颜色，并把 JSON 里的 `STRIP` 列表规范回二元组，坏文件回退到 `CYAN/BORDER`；
+- 设置中心、渐变条、预览块全部改为属性访问，不再按下标取字典。
+**回归测试**：新增 `ThemePaletteTests` 5 项（四套内置配色完整且不可变、`apply_theme` 别名导出不污染调色板、未知主题回落 blue、自定义文件校验与 `STRIP` 归一化、连续替换自定义配色时 `ACTIVE_PALETTE` 仍指向真正显示的对象）；集成检查里连续替换两次自定义配色并断言页面实际换色。
+实测：112 项单元测试、7 项集成检查、`ruff` 与 `compileall` 全过。
+
+**打包验证**：本地按 `统一工具箱.spec` 用 PyInstaller 6.22.2 重新打包，`dist/统一工具箱.exe` 为 19.5 MB（CI 下限 10 MB），嵌入图标可正常提取；启动后主窗口标题为“统一工具箱 v3.10.5”，关闭并清理进程树后无残留。CI 的 `build` job 仍需在打 tag 或手动 `workflow_dispatch` 时跑一次，确认 GitHub 侧 artifact 上传。

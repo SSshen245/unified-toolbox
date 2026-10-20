@@ -6,11 +6,12 @@ import fnmatch, hashlib, tempfile
 import urllib.request, urllib.error
 import ctypes, ctypes.wintypes
 import psutil
+from dataclasses import dataclass
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
 
 APP_NAME = "统一工具箱"
-APP_VERSION = "v3.10.5"
+APP_VERSION = "v3.10.6"
 
 # 托盘支持（可选依赖：缺失时自动降级为普通窗口行为）
 try:
@@ -22,68 +23,270 @@ except Exception:
     TRAY_OK = False
 
 # —— 主题系统：多套配色风格，设置中心实时切换 ——
-#    常量名（CYAN/PURPLE 等）沿用历史命名，仅在不同主题下映射到不同色值，
-#    避免全文件替换；apply_theme() 启动时与切换时统一改写模块级常量 ——
-THEMES = {
-    "blue": {
-        "label": "⚡ 电光蓝（默认）", "dark": True,
-        "BG": "#0d1117", "PANEL": "#161b22", "PANEL2": "#1c2330", "PANEL3": "#242d3d",
-        "BORDER": "#3d4a5f", "CYAN": "#0089e9", "PURPLE": "#00b4d8", "GREEN": "#2dd4a0",
-        "YELLOW": "#e8c25a", "RED": "#ff5a5a", "ORANGE": "#ff8c42", "TEXT": "#e6edf5",
-        "TEXT2": "#8b98ab", "MUTED": "#3d4a5f",
-        "STRIP": ("#0089e9", "#3c61c1"),
-    },
-    "purple": {
-        "label": "🌌 暗夜紫", "dark": True,
-        "BG": "#0e0c14", "PANEL": "#171420", "PANEL2": "#1e1a2b", "PANEL3": "#292240",
-        "BORDER": "#4a4066", "CYAN": "#a78bfa", "PURPLE": "#c084fc", "GREEN": "#34d399",
-        "YELLOW": "#fbbf24", "RED": "#f87171", "ORANGE": "#fb923c", "TEXT": "#ece8f5",
-        "TEXT2": "#a29bb8", "MUTED": "#4a4066",
-        "STRIP": ("#a78bfa", "#5b3fa8"),
-    },
-    "emerald": {
-        "label": "🌿 翡翠暗夜", "dark": True,
-        "BG": "#0a100d", "PANEL": "#111a15", "PANEL2": "#16221b", "PANEL3": "#1e3024",
-        "BORDER": "#3a5443", "CYAN": "#10b981", "PURPLE": "#2dd4bf", "GREEN": "#a3e635",
-        "YELLOW": "#facc15", "RED": "#f87171", "ORANGE": "#fb923c", "TEXT": "#e7f2ea",
-        "TEXT2": "#94a89c", "MUTED": "#3a5443",
-        "STRIP": ("#10b981", "#0b5c45"),
-    },
-    "light": {
-        "label": "☀ 极简白", "dark": False,
-        "BG": "#f5f7fa", "PANEL": "#ffffff", "PANEL2": "#eef1f5", "PANEL3": "#e2e8f0",
-        "BORDER": "#c3ccd8", "CYAN": "#0067c0", "PURPLE": "#7c3aed", "GREEN": "#0f9d6a",
-        "YELLOW": "#b45309", "RED": "#dc2626", "ORANGE": "#ea580c", "TEXT": "#1a2330",
-        "TEXT2": "#5a6a7e", "MUTED": "#9aa7b5",
-        "STRIP": ("#0089e9", "#7ab8e8"),
-    },
-}
+#    配色本身是不可变的 Palette 对象；历史代码仍按 CYAN/PANEL 等裸常量读取，
+#    因此 apply_theme() 保留一个受控的模块级别名层（唯一写入点），避免全文件
+#    一万多处引用改成 PALETTE.X 带来的无谓大改。 ——
 _THEME_KEYS = ("BG", "PANEL", "PANEL2", "PANEL3", "BORDER", "CYAN", "PURPLE",
                "GREEN", "YELLOW", "RED", "ORANGE", "TEXT", "TEXT2", "MUTED")
+
+
+@dataclass(frozen=True, kw_only=True)
+class Palette:
+    """一套不可变的主题配色；字段名与历史常量一致，便于别名层直接导出。"""
+    label: str
+    dark: bool
+    BG: str
+    PANEL: str
+    PANEL2: str
+    PANEL3: str
+    BORDER: str
+    CYAN: str
+    PURPLE: str
+    GREEN: str
+    YELLOW: str
+    RED: str
+    ORANGE: str
+    TEXT: str
+    TEXT2: str
+    MUTED: str
+    STRIP: tuple[str, str]
+
+    def as_globals(self):
+        """只导出颜色字段（供 apply_theme 写入模块级别名）。"""
+        return {key: getattr(self, key) for key in _THEME_KEYS}
+
+    def as_dict(self):
+        """导出为旧版字典格式（自定义配色文件 / 导出 JSON 用）。"""
+        data = {"label": self.label, "dark": self.dark}
+        data.update(self.as_globals())
+        data["STRIP"] = tuple(self.STRIP)
+        return data
+
+    @classmethod
+    def from_mapping(cls, data):
+        """从 JSON 字典构造并校验配色；缺字段或颜色不是字符串时抛 ValueError。"""
+        if not isinstance(data, dict):
+            raise ValueError("配色文件必须是 JSON 对象")
+        missing = [key for key in _THEME_KEYS if key not in data]
+        if missing:
+            raise ValueError("缺少必要配色字段：" + "、".join(missing))
+        colors = {}
+        for key in _THEME_KEYS:
+            value = data[key]
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(f"配色字段 {key} 必须是颜色字符串")
+            colors[key] = value.strip()
+        strip = data.get("STRIP") or (colors["CYAN"], colors["BORDER"])
+        if (not isinstance(strip, (list, tuple)) or len(strip) != 2
+                or not all(isinstance(c, str) and c.strip() for c in strip)):
+            strip = (colors["CYAN"], colors["BORDER"])
+        return cls(label=str(data.get("label") or "🎨 自定义"),
+                   dark=bool(data.get("dark", True)),
+                   STRIP=(strip[0].strip(), strip[1].strip()), **colors)
+
+
+THEMES = {
+    "blue": Palette(
+        label="⚡ 电光蓝（默认）", dark=True,
+        BG="#0d1117", PANEL="#161b22", PANEL2="#1c2330", PANEL3="#242d3d",
+        BORDER="#3d4a5f", CYAN="#0089e9", PURPLE="#00b4d8", GREEN="#2dd4a0",
+        YELLOW="#e8c25a", RED="#ff5a5a", ORANGE="#ff8c42", TEXT="#e6edf5",
+        TEXT2="#8b98ab", MUTED="#3d4a5f",
+        STRIP=("#0089e9", "#3c61c1"),
+    ),
+    "purple": Palette(
+        label="🌌 暗夜紫", dark=True,
+        BG="#0e0c14", PANEL="#171420", PANEL2="#1e1a2b", PANEL3="#292240",
+        BORDER="#4a4066", CYAN="#a78bfa", PURPLE="#c084fc", GREEN="#34d399",
+        YELLOW="#fbbf24", RED="#f87171", ORANGE="#fb923c", TEXT="#ece8f5",
+        TEXT2="#a29bb8", MUTED="#4a4066",
+        STRIP=("#a78bfa", "#5b3fa8"),
+    ),
+    "emerald": Palette(
+        label="🌿 翡翠暗夜", dark=True,
+        BG="#0a100d", PANEL="#111a15", PANEL2="#16221b", PANEL3="#1e3024",
+        BORDER="#3a5443", CYAN="#10b981", PURPLE="#2dd4bf", GREEN="#a3e635",
+        YELLOW="#facc15", RED="#f87171", ORANGE="#fb923c", TEXT="#e7f2ea",
+        TEXT2="#94a89c", MUTED="#3a5443",
+        STRIP=("#10b981", "#0b5c45"),
+    ),
+    "light": Palette(
+        label="☀ 极简白", dark=False,
+        BG="#f5f7fa", PANEL="#ffffff", PANEL2="#eef1f5", PANEL3="#e2e8f0",
+        BORDER="#c3ccd8", CYAN="#0067c0", PURPLE="#7c3aed", GREEN="#0f9d6a",
+        YELLOW="#b45309", RED="#dc2626", ORANGE="#ea580c", TEXT="#1a2330",
+        TEXT2="#5a6a7e", MUTED="#9aa7b5",
+        STRIP=("#0089e9", "#7ab8e8"),
+    ),
+}
 THEME_NAME = "blue"      # 当前主题 key
 THEME_IS_DARK = True     # 当前主题是否深色（决定系统标题栏走向）
 
 # 默认值先按电光蓝落位（apply_theme 会在启动时按设置覆盖）
-BG = "#0d1117"; PANEL = "#161b22"; PANEL2 = "#1c2330"; PANEL3 = "#242d3d"
-BORDER = "#3d4a5f"; CYAN = "#0089e9"; PURPLE = "#00b4d8"; GREEN = "#2dd4a0"
-YELLOW = "#e8c25a"; RED = "#ff5a5a"; ORANGE = "#ff8c42"; TEXT = "#e6edf5"
-TEXT2 = "#8b98ab"; MUTED = "#3d4a5f"
+_BLUE = THEMES["blue"]
+ACTIVE_PALETTE = _BLUE   # 当前真正应用到控件上的调色板（THEMES 里的条目可能已被替换）
+BG, PANEL, PANEL2, PANEL3 = (_BLUE.BG, _BLUE.PANEL,
+                             _BLUE.PANEL2, _BLUE.PANEL3)
+BORDER, CYAN, PURPLE = _BLUE.BORDER, _BLUE.CYAN, _BLUE.PURPLE
+GREEN, YELLOW, RED = _BLUE.GREEN, _BLUE.YELLOW, _BLUE.RED
+ORANGE, TEXT, TEXT2, MUTED = _BLUE.ORANGE, _BLUE.TEXT, _BLUE.TEXT2, _BLUE.MUTED
 FONT_UI = "Microsoft YaHei UI"; FONT_MONO = "Consolas"
 # 背景基色 RGB（渐变面积计算用）
 BG_R, BG_G, BG_B = 0x0d, 0x11, 0x17
 
 
 def apply_theme(name):
-    """把指定主题的色值写入模块级常量（全局生效，控件在创建时读取）。"""
-    global THEME_NAME, THEME_IS_DARK, BG_R, BG_G, BG_B
-    t = THEMES.get(name) or THEMES["blue"]
+    """把指定主题的色值写入模块级常量（全局生效，控件在创建时读取）。
+
+    Palette 本身不可变；这里只做一次兼容性导出。全文件仍按历史习惯读取
+    CYAN/PANEL 等裸常量，逐个改成 THEMES[...].X 会带来大范围无谓改动。
+    """
+    global THEME_NAME, THEME_IS_DARK, BG_R, BG_G, BG_B, ACTIVE_PALETTE
+    palette = THEMES.get(name) or THEMES["blue"]
     THEME_NAME = name if name in THEMES else "blue"
-    g = globals()
-    for k in _THEME_KEYS:
-        g[k] = t[k]
-    THEME_IS_DARK = bool(t.get("dark", True))
+    globals().update(palette.as_globals())
+    THEME_IS_DARK = palette.dark
+    ACTIVE_PALETTE = palette
     BG_R, BG_G, BG_B = int(BG[1:3], 16), int(BG[3:5], 16), int(BG[5:7], 16)
-    return t
+    return palette
+
+
+def _theme_color_map(old_theme, new_theme):
+    """旧主题色值 → 新主题色值。相同值不进映射（少改一批控件）。
+
+    注意 blue/purple/emerald 里 BORDER 与 MUTED 是同一个灰，转成浅色主题时
+    后者会覆盖前者：边框会偏深一点，但仍在可读范围内。
+    """
+    out = {}
+    for k in _THEME_KEYS:
+        a = str(old_theme.get(k, "")).lower()
+        b = new_theme.get(k)
+        if a and isinstance(b, str) and a != b.lower():
+            out[a] = b
+    return out
+
+
+# 需要跟着主题走的 tk 控件选项（ttk 走 style，不在这里）
+_RECOLOR_OPTS = ("background", "foreground", "activebackground", "activeforeground",
+                 "highlightbackground", "highlightcolor", "insertbackground",
+                 "selectbackground", "selectforeground", "disabledforeground",
+                 "troughcolor", "readonlybackground", "selectcolor")
+
+
+def _recolor_one(widget, mapping):
+    """按色值映射改写单个控件的颜色（含 Canvas 图元 / Treeview 标签 / Text 标签）。"""
+    for opt in _RECOLOR_OPTS:
+        try:
+            cur = widget.cget(opt)
+        except Exception:
+            continue
+        if not isinstance(cur, str):
+            continue
+        new = mapping.get(cur.lower())
+        if new:
+            try:
+                widget.configure(**{opt: new})
+            except Exception:
+                pass
+    if isinstance(widget, tk.Canvas):
+        for item in widget.find_all():
+            for opt in ("fill", "outline"):
+                try:
+                    cur = widget.itemcget(item, opt)
+                except Exception:
+                    continue
+                new = mapping.get(str(cur).lower())
+                if new:
+                    try:
+                        widget.itemconfigure(item, **{opt: new})
+                    except Exception:
+                        pass
+    elif isinstance(widget, tk.Text):
+        for tag in widget.tag_names():
+            kw = {}
+            for opt in ("background", "foreground"):
+                try:
+                    cur = widget.tag_cget(tag, opt)
+                except Exception:
+                    continue
+                new = mapping.get(str(cur).lower())
+                if new:
+                    kw[opt] = new
+            if kw:
+                try:
+                    widget.tag_configure(tag, **kw)
+                except Exception:
+                    pass
+    elif isinstance(widget, tk.Listbox):
+        for i in range(widget.size()):
+            kw = {}
+            for opt in ("background", "foreground"):
+                try:
+                    new = mapping.get(str(widget.itemcget(i, opt)).lower())
+                except Exception:
+                    continue
+                if new:
+                    kw[opt] = new
+            if kw:
+                try:
+                    widget.itemconfigure(i, **kw)
+                except Exception:
+                    pass
+    elif isinstance(widget, ttk.Treeview):
+        try:
+            tags = widget.tk.splitlist(widget.tk.call(widget._w, "tag", "names"))
+        except Exception:
+            tags = ()
+        for tag in tags:
+            tag = str(tag)
+            try:
+                pairs = widget.tk.splitlist(
+                    widget.tk.call(widget._w, "tag", "configure", tag))
+            except Exception:
+                continue
+            kw = {}
+            for i in range(0, len(pairs) - 1, 2):
+                new = mapping.get(str(pairs[i + 1]).lower())
+                if new:
+                    # 选项名可能是 Tcl_Obj（不可哈希），统一转成 str
+                    kw[str(pairs[i])] = new
+            if kw:
+                try:
+                    widget.tag_configure(tag, **kw)
+                except Exception:
+                    pass
+
+
+def recolor_widget_tree(widget, mapping):
+    """递归把整棵控件树从旧配色改成新配色。"""
+    if not mapping:
+        return
+    seen = set()
+
+    def walk(w):
+        path = str(w)
+        if path in seen:
+            return
+        seen.add(path)
+        _recolor_one(w, mapping)
+        try:
+            children = w.winfo_children()
+        except Exception:
+            return
+        for child in children:
+            walk(child)
+
+    walk(widget)
+
+
+def _paint_theme_chip(tdef, swatch, dot, sel):
+    """设置中心里每个主题预览块始终用它自己那套配色（不能跟着全局映射走）。"""
+    chip_bg = tdef.BG if tdef.dark else tdef.PANEL2
+    swatch.config(bg=chip_bg, highlightbackground=tdef.BORDER)
+    dot.config(bg=chip_bg, fg=tdef.CYAN)
+    sel.config(text=tdef.label, bg=chip_bg, fg=tdef.TEXT,
+               selectcolor=tdef.BG,
+               activebackground=chip_bg, activeforeground=tdef.CYAN)
 
 
 HISTORY_FILE = Path.home() / ".unified_toolbox_history.json"
@@ -178,7 +381,8 @@ def _as_int(value, default, lo=None, hi=None):
     """
     try:
         n = int(float(value))
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
+        # float("1e309") == inf，int(inf) 抛 OverflowError；手改设置文件可触发
         n = int(default)
     if lo is not None and n < lo:
         n = lo
@@ -205,7 +409,9 @@ UPDATE_REPO_FALLBACK = "gitee:szszz/unified-toolbox"
 # "'latin-1' codec can't encode characters"）。用纯 ASCII 的 UA。
 _UPDATE_UA = {"User-Agent": "UnifiedToolbox-UpdateCheck",
               "Accept": "application/vnd.github+json"}
-_CHECK_CACHE = {"repo": None, "at": 0.0, "result": None}   # 查询结果缓存（10 分钟）
+_CHECK_CACHE = {"repo": None, "at": 0.0, "result": None, "sha": ""}   # 查询结果缓存（10 分钟）
+# 最近一次查询到的更新包 SHA256（Release 附带 <exe>.sha256 时才有；空串=不校验）
+_LAST_RELEASE_SHA = ""
 
 
 def version_key(v):
@@ -267,6 +473,31 @@ def _fetch_release_once(spec_, timeout):
     url = pick.get("browser_download_url")
     if use_api_asset:
         url = pick.get("url") or url
+    # 可选：Release 里同名的 <exe>.sha256 校验文件（release.py 会自动上传）。
+    # 没有就跳过校验——兼容尚未附带校验文件的旧版本；有则下载并记下哈希。
+    global _LAST_RELEASE_SHA
+    _LAST_RELEASE_SHA = ""
+    want_sha = (str(pick.get("name") or "").lower() + ".sha256")
+    for a in assets:
+        if str(a.get("name", "")).lower() != want_sha:
+            continue
+        su = (a.get("url") if use_api_asset else a.get("browser_download_url")) \
+            or a.get("browser_download_url")
+        if not su:
+            break
+        try:
+            h = dict(headers)
+            if use_api_asset:
+                h["Accept"] = "application/octet-stream"
+            req_s = urllib.request.Request(su, headers=h)
+            with urllib.request.urlopen(req_s, timeout=min(timeout, 8)) as resp_s:
+                text_s = resp_s.read(4096).decode("ascii", "ignore")
+            m_s = re.search(r"\b([0-9a-fA-F]{64})\b", text_s)
+            if m_s:
+                _LAST_RELEASE_SHA = m_s.group(1).lower()
+        except Exception:
+            pass        # 校验文件拉不到不影响正常更新，只是退回"不校验"
+        break
     return tag, url, pick.get("name"), None
 
 
@@ -283,32 +514,40 @@ def fetch_latest_release(repo, timeout=15, use_cache=True):
       （国内家宽的匿名额度是同公网 IP 的所有人共享的，被陌生人打满
       自己也会被限）
     """
-    global _CHECK_CACHE
+    global _CHECK_CACHE, _LAST_RELEASE_SHA
     repo = (repo or "").strip().strip("/")
     now = time.time()
     if use_cache and _CHECK_CACHE["repo"] == repo and now - _CHECK_CACHE["at"] < 600:
+        _LAST_RELEASE_SHA = str(_CHECK_CACHE.get("sha") or "")
         return _CHECK_CACHE["result"]
     result = _fetch_release_once(repo, timeout)
+    sha = _LAST_RELEASE_SHA
     err = result[3]
     if err and not err.startswith(_FATAL_PREFIX) \
             and not repo.lower().startswith("gitee:") and UPDATE_REPO_FALLBACK:
         fb = _fetch_release_once(UPDATE_REPO_FALLBACK, timeout)
         if fb[0]:
             result = fb
+            sha = _LAST_RELEASE_SHA
         elif fb[3] and fb[3] != err:
             # 两边都没成功：把备用源失败的原因也亮出来，方便发现
             # "镜像没建 Release / 没传附件" 这类问题
             result = (None, None, None, err + "；备用源也不可用（%s）" % fb[3])
     if result[3] is None:
-        _CHECK_CACHE.update(repo=repo, at=now, result=result)
+        _CHECK_CACHE.update(repo=repo, at=now, result=result, sha=sha)
+        _LAST_RELEASE_SHA = sha
     return result
 
 
-def download_update(url, dest, progress=None, timeout=300):
+def download_update(url, dest, progress=None, timeout=300, cancel=None,
+                    expect_sha=None):
     """下载更新包到 dest。progress(done, total) 报进度。返回错误串或 ""。
 
     Accept 必须是 application/octet-stream：asset 端点靠这个头才会返回文件
     本体（否则返回 JSON 元数据），随后 302 到资产 CDN。
+    cancel：threading.Event，置位后中止下载并删除半成品。
+    expect_sha：Release 附带 <exe>.sha256 时传入；下载完做 SHA256 校验，
+    不匹配立即删除文件并报错（防止 CDN 劫持/半包/错版本）。
     """
     try:
         req = urllib.request.Request(url, headers={
@@ -319,6 +558,8 @@ def download_update(url, dest, progress=None, timeout=300):
             done = 0
             with open(dest, "wb") as f:
                 while True:
+                    if cancel is not None and cancel.is_set():
+                        raise RuntimeError("cancelled")
                     chunk = resp.read(256 * 1024)
                     if not chunk:
                         break
@@ -326,12 +567,29 @@ def download_update(url, dest, progress=None, timeout=300):
                     done += len(chunk)
                     if progress:
                         progress(done, total)
+            if total and done < total:
+                raise RuntimeError("incomplete %d/%d" % (done, total))
+            if expect_sha:
+                h = hashlib.sha256()
+                with open(dest, "rb") as fh:
+                    for block in iter(lambda: fh.read(1024 * 1024), b""):
+                        h.update(block)
+                got = h.hexdigest().lower()
+                if got != str(expect_sha).strip().lower():
+                    raise RuntimeError("hash mismatch %s" % got)
         return ""
     except Exception as e:
         try:
             Path(dest).unlink(missing_ok=True)
         except Exception:
             pass
+        if cancel is not None and cancel.is_set():
+            return "已取消下载"
+        if "incomplete" in str(e):
+            return "下载不完整（连接中断），请重试：%s" % e
+        if "hash mismatch" in str(e):
+            return ("更新包校验失败（SHA256 与 Release 公布值不一致），"
+                    "文件已删除。请重试；若反复失败请手动到 Release 页面下载。")
         return "下载失败：%s" % e
 
 
@@ -342,19 +600,35 @@ def download_update(url, dest, progress=None, timeout=300):
 # （实测：只等当前 PID + copy 一次，单文件版会复制失败且不留任何提示）。
 _UPDATE_SWAPPER = r"""@echo off
 setlocal
+rem Health-check window: how long the new build has to report "UI is up".
+rem Overridable so the rollback path can be tested without waiting a minute.
+set "WAIT=60"
+if defined UTB_UPDATE_SWAPPER_TEST set "WAIT=1"
 :wait
 tasklist /FI "IMAGENAME eq %~nx2" 2>nul | find /I "%~nx2" >nul
 if not errorlevel 1 (
   ping -n 2 127.0.0.1 >nul
   goto wait
 )
+rem Back up the working exe FIRST: if the new build cannot start we restore it.
+copy /y "%~2" "%~2.old" >nul
+if errorlevel 1 (
+  echo %DATE% %TIME% backup failed: cannot copy current exe> "%TEMP%\utb_update_error.txt"
+  exit /b 1
+)
 set /a TRIES=0
 :copy
-copy /y "%~1" "%~2" >nul
+rem Copy next to the target, then move: a same-volume rename is atomic, so a
+rem power loss can never leave a half-written exe in place.
+copy /y "%~1" "%~2.new" >nul
+if errorlevel 1 goto copyfail
+move /y "%~2.new" "%~2" >nul
 if not errorlevel 1 goto run
+:copyfail
 set /a TRIES+=1
 if %TRIES% GEQ 20 (
-  echo %DATE% %TIME% replace failed: target locked> "%~dp1utb_update_error.txt"
+  echo %DATE% %TIME% replace failed: target locked> "%TEMP%\utb_update_error.txt"
+  del "%~2.new" >nul 2>&1
   exit /b 1
 )
 ping -n 3 127.0.0.1 >nul
@@ -380,17 +654,48 @@ rem PYINSTALLER_RESET_ENVIRONMENT=1 tells the bootloader to start as a fresh
 rem top-level process, which skips that verification completely. The bootloader
 rem clears the variable itself, so anything the app spawns later is unaffected.
 set PYINSTALLER_RESET_ENVIRONMENT=1
-start "" "%~2"
+if not defined UTB_UPDATE_SWAPPER_TEST start "" "%~2"
 set PYINSTALLER_RESET_ENVIRONMENT=
-rem Insurance: linger a few seconds so the launch is well underway before
-rem this cmd deletes itself.
-ping -n 8 127.0.0.1 >nul
+rem Health check: the new instance writes utb_update_ok.flag once its window is
+rem up. No flag AND the process already gone = the new build is unusable ->
+rem restore the backup and restart the previous version.
+set /a WAITED=0
+:health
+if exist "%TEMP%\utb_update_ok.flag" goto healthy
+set /a WAITED+=1
+if %WAITED% GEQ %WAIT% goto healthfail
+ping -n 2 127.0.0.1 >nul
+goto health
+:healthy
+del "%TEMP%\utb_update_ok.flag" >nul 2>&1
+del "%~2.old" >nul 2>&1
+goto done
+:healthfail
+rem Alive but slow (no marker yet): keep the new version, leave the backup for
+rem the app's next-start cleanup. Dead without a marker: roll back.
+tasklist /FI "IMAGENAME eq %~nx2" 2>nul | find /I "%~nx2" >nul
+if not errorlevel 1 goto done
+copy /y "%~2.old" "%~2" >nul
+if errorlevel 1 (
+  echo %DATE% %TIME% rollback failed: backup could not be restored> "%TEMP%\utb_update_error.txt"
+  goto done
+)
+echo %DATE% %TIME% update rollback: new build did not start, previous version restored> "%TEMP%\utb_update_error.txt"
+del "%~2.old" >nul 2>&1
+rem The crashed build may not have consumed the marker; do not let the restored
+rem instance think it is an after-update launch.
+del "%TEMP%\utb_after_update.flag" >nul 2>&1
+if not defined UTB_UPDATE_SWAPPER_TEST start "" "%~2"
+:done
+ping -n 2 127.0.0.1 >nul
 rem (goto) idiom: a running .cmd cannot del itself directly
 (goto) 2>nul & del "%~f0" >nul 2>&1
 """
 
 
 _UPDATE_FLAG_NAME = "utb_after_update.flag"   # 必须与上面批处理里的名字一致
+_UPDATE_OK_FLAG = "utb_update_ok.flag"        # 新版启动成功后的健康标记（同上）
+_UPDATE_ERROR_FILE = "utb_update_error.txt"   # 替换失败/回滚记录（同上）
 
 
 def consume_update_flag():
@@ -407,6 +712,46 @@ def consume_update_flag():
     except OSError:
         pass
     return False
+
+
+def mark_update_ok():
+    """新版启动成功后写健康标记。
+
+    替换脚本最多等 60 秒；等到标记就删除 .old 备份，等不到且新进程已退出
+    就自动回滚。所以这里必须在新窗口真正建好之后才写（不能一进 main 就写）。
+    """
+    try:
+        (Path(tempfile.gettempdir()) / _UPDATE_OK_FLAG).write_text("ok", encoding="ascii")
+    except OSError:
+        pass
+
+
+def take_update_error():
+    """取用上次替换失败/回滚的记录（读后删除，返回空串表示没有）。"""
+    path = Path(tempfile.gettempdir()) / _UPDATE_ERROR_FILE
+    try:
+        if path.exists():
+            text = path.read_text(encoding="utf-8", errors="replace").strip()
+            path.unlink(missing_ok=True)
+            return text
+    except OSError:
+        pass
+    return ""
+
+
+def cleanup_stale_update_files():
+    """删除上次更新残留的 .old/.new（只在正常启动、窗口稳定后调用）。
+
+    回滚成功时脚本会自己删；脚本中途被杀或新进程起得太慢时可能留下，
+    下次正常启动再清，避免安装目录里长期躺着几十 MB 的旧 exe。
+    """
+    if not getattr(sys, "frozen", False):
+        return
+    for suffix in (".old", ".new"):
+        try:
+            Path(sys.executable + suffix).unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 def write_update_swapper():
@@ -466,12 +811,8 @@ try:
     _ctf = Path.home() / ".unified_toolbox_theme_custom.json"
     if SETTINGS.get("theme") == "custom" and _ctf.exists():
         _ct = json.loads(_ctf.read_text(encoding="utf-8"))
-        if isinstance(_ct, dict) and all(k in _ct for k in _THEME_KEYS):
-            _ct.setdefault("dark", True)
-            _ct.setdefault("label", "🎨 自定义")
-            _ct.setdefault("STRIP", (_ct["CYAN"], _ct["BORDER"]))
-            THEMES["custom"] = {k: _ct[k] for k in
-                                list(_THEME_KEYS) + ["dark", "label", "STRIP"] if k in _ct}
+        if isinstance(_ct, dict):
+            THEMES["custom"] = Palette.from_mapping(_ct)
 except Exception:
     pass
 apply_theme(SETTINGS.get("theme", "blue"))   # 启动即应用已保存的主题
@@ -778,6 +1119,14 @@ def get_file_icon_img(path, size=28):
                 u32.DestroyIcon(hico)
         except Exception:
             img = None
+    if len(_ICON_CACHE) > 4096:
+        # 无上限的图标缓存会随"逛过的目录/装过的软件"一直涨，
+        # 每项都是一张 RGBA 图。超限丢最早一批（dict 保持插入顺序）。
+        for _ in range(1024):
+            try:
+                _ICON_CACHE.pop(next(iter(_ICON_CACHE)))
+            except Exception:   # 并发插入导致的 KeyError/RuntimeError：下一轮再清
+                break
     _ICON_CACHE[key] = img
     return img
 
@@ -811,6 +1160,12 @@ def get_exe_company(path):
                         break
     except Exception:
         company = ""
+    if len(_EXE_PUB_CACHE) > 8192:
+        for _ in range(2048):
+            try:
+                _EXE_PUB_CACHE.pop(next(iter(_EXE_PUB_CACHE)))
+            except Exception:   # 并发插入导致的 KeyError/RuntimeError：下一轮再清
+                break
     _EXE_PUB_CACHE[key] = company
     return company
 
@@ -991,8 +1346,18 @@ def get_extra_info():
         v = _run(cmd)
         return [x.strip() for x in v.replace("\n", "\r").split("\r") if x.strip()]
 
+    # GPU / BIOS / 磁盘型号三路 PowerShell 并发跑：串行时每个约 1s，
+    # 叠起来就是硬件页首屏 3~4 秒的空白。
+    _pool = ThreadPoolExecutor(max_workers=3)
+    f_gpu = _pool.submit(
+        _run, 'powershell -NoProfile -Command "(Get-CimInstance Win32_VideoController)[-1].Name"')
+    f_bios = _pool.submit(
+        _run, 'powershell -NoProfile -Command "(Get-CimInstance Win32_BIOS).SMBIOSBIOSVersion"')
+    f_disk = _pool.submit(
+        _run_list, 'powershell -NoProfile -Command "(Get-CimInstance Win32_DiskDrive).Model"')
+
     # GPU
-    gpu = _run('powershell -NoProfile -Command "(Get-CimInstance Win32_VideoController)[-1].Name"')
+    gpu = f_gpu.result()
     if gpu: extra["GPU"] = gpu
 
     # 显存：Win32_VideoController.AdapterRAM 是 32 位无符号数，>4GB 的显卡会
@@ -1025,7 +1390,7 @@ def get_extra_info():
 
     # BIOS：WMI 查询可能空返回/超时，注册表 HARDWARE 描述块是更快的可靠来源；
     # 版本号后附带发布日期（如 "2803 (04/28/2022)"）
-    bios = _run('powershell -NoProfile -Command "(Get-CimInstance Win32_BIOS).SMBIOSBIOSVersion"')
+    bios = f_bios.result()
     if not bios or len(bios) > 60 or "\n" in bios:
         bios = str(_reg_read(winreg.HKEY_LOCAL_MACHINE,
                              r"HARDWARE\DESCRIPTION\System\BIOS", "BIOSVersion") or "")
@@ -1051,7 +1416,8 @@ def get_extra_info():
         extra["安全启动"] = "已启用" if sb == 1 or str(sb) == "1" else "已关闭"
 
     # 磁盘：列出全部物理盘型号（去重，最多 3 块）
-    disk_models = _run_list('powershell -NoProfile -Command "(Get-CimInstance Win32_DiskDrive).Model"')
+    disk_models = f_disk.result()
+    _pool.shutdown(wait=False)
     seen_d = []
     for m in disk_models:
         if m not in seen_d:
@@ -1153,7 +1519,7 @@ def _vram_total_bytes():
     return 0
 
 
-_GPU_PS_STATE = {"ok": None}   # None=未探测 / True=可用 / False=本会话禁用
+_GPU_PS_STATE = {"ok": None, "retry_at": 0.0}   # None=未探测 / True=可用 / False=暂缓
 
 
 def query_gpu_status():
@@ -1177,7 +1543,11 @@ def query_gpu_status():
         pass
     # —— 通用 GPU 计数器路径（这台机器是 RX 5600 XT，nvidia-smi 永远为空）——
     if _GPU_PS_STATE["ok"] is False:
-        return ""
+        # 失败不再"本会话永久禁用"：一次性 PowerShell 超时/被杀软拦截会把
+        # GPU 显示永久关掉。改为 10 分钟后自动重试一次。
+        if time.time() < _GPU_PS_STATE.get("retry_at", 0.0):
+            return ""
+        _GPU_PS_STATE["ok"] = None
     try:
         si = subprocess.STARTUPINFO()
         si.dwFlags = subprocess.STARTF_USESHOWWINDOW
@@ -1202,7 +1572,8 @@ def query_gpu_status():
         _GPU_PS_STATE["ok"] = True
         return txt
     except Exception:
-        _GPU_PS_STATE["ok"] = False   # 计数器不可用（精简系统/驱动不支持），本会话不再重试
+        _GPU_PS_STATE["ok"] = False   # 计数器暂不可用（精简系统/驱动不支持）
+        _GPU_PS_STATE["retry_at"] = time.time() + 600
         return ""
 
 
@@ -2644,8 +3015,13 @@ def privacy_toggle_state(tid):
 
 
 def privacy_toggle_apply(tid, off):
-    """应用/还原隐私项（off=True 关闭该功能；False 删除值回到系统默认）。"""
+    """应用/还原隐私项（off=True 关闭该功能；False 删除值回到系统默认）。
+
+    返回失败列表 [(sub, name)]；空列表表示全部写入成功。旧实现吞掉所有
+    OSError 并恒返回 True，UI 于是永远显示"已应用"，权限不足时用户被误导。
+    """
     import winreg
+    failed = []
     for t in _PRIVACY_TOGGLES:
         if t["id"] != tid:
             continue
@@ -2660,9 +3036,135 @@ def privacy_toggle_apply(tid, off):
                                         winreg.KEY_SET_VALUE) as k:
                         winreg.DeleteValue(k, name)
             except OSError:
-                pass
-        return True
-    return False
+                failed.append((sub, name))
+        return failed
+    return failed
+
+
+# ═══════════════════════════════════════════
+# 共用控件：次级按钮 / Treeview 排序
+# ═══════════════════════════════════════════
+
+def make_secondary_button(parent, text, command, color=CYAN, font_size=9,
+                          side="left", padx=(0, 6), pady=4):
+    """深色主题的次级按钮：PANEL2 底、主题色文字、悬停提亮。
+
+    各模块原先各抄一份 `_mkbtn`，字体/边距/PANEL3 悬停略有漂移。这里统一
+    实现，模块方法只保留自己默认的字号与颜色（见各 `_mkbtn`）。
+    """
+    button = tk.Button(parent, text=text, bg=PANEL2, fg=color,
+                       font=(FONT_UI, font_size), bd=0, relief="flat",
+                       cursor="hand2", command=command)
+    button.pack(side=side, padx=padx, pady=pady)
+    button.bind("<Enter>", lambda _event=None, b=button: b.config(bg=PANEL3))
+    button.bind("<Leave>", lambda _event=None, b=button: b.config(bg=PANEL2))
+    return button
+
+
+def sort_treeview(tree, column, key=None, reverse=False):
+    """按 `column` 就地重排行，不重建 Treeview、不打断选中/滚动。
+
+    `key(text)` 把单元格文本换成可比较的值（字节数、CPU 百分比、PID 等）；
+    默认直接按文本排。行是 `tree.move` 挪的，所以 tag/绑定都保留。
+    """
+    rows = [(tree.set(iid, column), iid) for iid in tree.get_children()]
+    if key is None:
+        rows.sort(reverse=reverse)
+    else:
+        rows.sort(key=lambda row: key(row[0]), reverse=reverse)
+    for index, (_value, iid) in enumerate(rows):
+        tree.move(iid, "", index)
+
+
+# ═══════════════════════════════════════════
+# 后台任务 → 主线程投递（统一 queue + after 骨架）
+# ═══════════════════════════════════════════
+
+class _WorkerFailure:
+    """后台工作函数抛出的异常，由 run_in_background 在主线程转交。"""
+    __slots__ = ("error",)
+
+    def __init__(self, error):
+        self.error = error
+
+
+def run_in_background(widget, work, handle, interval=200, alive=None, on_error=None):
+    """在 daemon 线程跑 `work`，把消息按序交给主线程的 `handle`。
+
+    Tk 只能在主线程碰控件，所以旧代码到处手写「queue.Queue + get_nowait +
+    queue.Empty 时 after 续排」。这里把这套骨架收成一个函数：
+
+    - `work(report)` 在后台线程执行；`report(message)` 线程安全，可调用多次
+      （进度、日志、最终结果都走它）。
+    - `handle(message)` 在主线程执行；返回 False 可提前结束轮询。
+    - 后台函数返回且队列排空后**自动停止**，调用方不再需要判断"最后一条"。
+    - `widget` 被销毁、或 `alive()` 返回 False（例如页面扫描 token 已被替换）
+      时立即停止，不再对死控件调 after。
+    - `work` 抛异常：交给 `on_error(exc)`；未提供时走 Tk 的
+      report_callback_exception，与直接在回调里抛异常一致，不会永远卡在"查询中"。
+
+    返回 None；停止条件由上面几条自动覆盖，无需调用方持有定时器 id。
+    """
+    messages = queue.Queue()
+    # 完成标记走同一队列：FIFO 保证它排在所有结果之后，不会出现
+    # “刚判空、worker 又放入结果、finished 已置位”导致结果被丢掉。
+    done_marker = object()
+
+    def report(message):
+        messages.put(message)
+
+    def runner():
+        try:
+            work(report)
+        except Exception as exc:      # noqa: BLE001 - 必须转交主线程
+            messages.put(_WorkerFailure(exc))
+        finally:
+            messages.put(done_marker)
+
+    def report_error(exc):
+        if on_error is not None:
+            on_error(exc)
+            return
+        try:
+            widget._root().report_callback_exception(
+                type(exc), exc, exc.__traceback__)
+        except Exception:
+            pass
+
+    def poll():
+        try:
+            if not widget.winfo_exists():
+                return
+        except Exception:
+            return
+        if alive is not None:
+            try:
+                if not alive():
+                    return
+            except Exception:
+                return
+        while True:
+            try:
+                message = messages.get_nowait()
+            except queue.Empty:
+                break
+            if message is done_marker:
+                return
+            if isinstance(message, _WorkerFailure):
+                report_error(message.error)
+                return
+            if handle(message) is False:
+                return
+        try:
+            widget.after(interval, poll)
+        except Exception:
+            pass
+
+    threading.Thread(target=runner, daemon=True).start()
+    try:
+        widget.after(interval, poll)
+    except Exception:
+        pass
 
 
 # ═══════════════════════════════════════════
@@ -2680,13 +3182,8 @@ class BaseModule:
 
     def _mkbtn(self, parent, text, cmd, color=CYAN, side="left"):
         """统一次级按钮：PANEL2 底 + 主题色文字 + 悬停提亮（各模块共用，避免风格漂移）"""
-        btn = tk.Button(parent, text=text, bg=PANEL2, fg=color,
-                        font=(FONT_UI, 9), bd=0, relief="flat",
-                        cursor="hand2", command=cmd)
-        btn.pack(side=side, padx=(0, 6), pady=3)
-        btn.bind("<Enter>", lambda e=None, b=btn: b.config(bg=PANEL3))
-        btn.bind("<Leave>", lambda e=None, b=btn: b.config(bg=PANEL2))
-        return btn
+        return make_secondary_button(parent, text, cmd, color=color,
+                                     side=side, pady=3)
 
 
 # ═══════════════════════════════════════════
@@ -3316,14 +3813,13 @@ class HardwareModule(BaseModule):
         self.star_area.bind("<Configure>", _on_star_resize)
 
         self._ui_ready = False
-        self._cached_hw = self._cached_extra = self._cached_disk = self._cached_proc = self._cached_star = None
-        self._cached_health = None
-    def _make_btn(self, parent, text, cmd, color=CYAN):
-        btn = tk.Button(parent, text=text, bg=PANEL2, fg=color, font=(FONT_UI, 9),
-                        bd=0, relief="flat", cursor="hand2", command=cmd)
-        btn.pack(side="left", padx=(0, 6), pady=4)
-        btn.bind("<Enter>", lambda e=None, b=btn: b.config(bg=PANEL3))
-        btn.bind("<Leave>", lambda e=None, b=btn: b.config(bg=PANEL2))
+        # 缓存跨页面重建保留：_switch 会销毁并重建整页，旧实现每次 build 都把
+        # 缓存清零，于是每次切回硬件页都重新跑 6 项扫描（多次 PowerShell）。
+        if not hasattr(self, "_cached_hw"):
+            self._cached_hw = self._cached_extra = self._cached_disk = None
+            self._cached_proc = self._cached_star = None
+            self._cached_health = None
+            self._full_scan_ts = 0.0
 
     def start(self):
         self._stop_flag = threading.Event()
@@ -3346,21 +3842,25 @@ class HardwareModule(BaseModule):
             self._gauge_started = True
             self._gauge_job = self.root.after(33, self._gauge_tick)
         # 全部扫描异步化（PowerShell 取硬件信息串行执行曾是 4.8s 卡顿源），
-        # 结果经队列由 _run_in_queue 在 UI 线程渲染，缓存机制不变
-        def _bg_scan():
-            try: self._q.put(("info", get_sys_info()))
-            except: pass
-            try: self._q.put(("star", get_startup()))
-            except: pass
-            try: self._q.put(("proc", get_processes()))
-            except: pass
-            try: self._q.put(("disk", get_disks()))
-            except: pass
-            try: self._q.put(("extra", get_extra_info()))
-            except: pass
-            try: self._q.put(("health", get_disk_health()))
-            except: pass
-        threading.Thread(target=_bg_scan, daemon=True).start()
+        # 结果经队列由 _run_in_queue 在 UI 线程渲染。
+        # 60s 内切回本页直接复用缓存，不重复触发重扫（旧版每次切页都重扫）。
+        if time.time() - getattr(self, "_full_scan_ts", 0.0) >= 60:
+            self._full_scan_ts = time.time()
+
+            def _bg_scan():
+                try: self._q.put(("info", get_sys_info()))
+                except: pass
+                try: self._q.put(("star", get_startup()))
+                except: pass
+                try: self._q.put(("proc", get_processes()))
+                except: pass
+                try: self._q.put(("disk", get_disks()))
+                except: pass
+                try: self._q.put(("extra", get_extra_info()))
+                except: pass
+                try: self._q.put(("health", get_disk_health()))
+                except: pass
+            threading.Thread(target=_bg_scan, daemon=True).start()
 
     def _scan_loop(self):
         """后台定期刷新数据（只在当前 Tab 时运行；stop 时休眠不退出）。"""
@@ -3816,20 +4316,14 @@ class HardwareModule(BaseModule):
         self.proc_count_lbl.config(text=f"共 {len(procs)} 个")
 
     def _sort_procs(self, col):
-        """进程表头点击排序（CPU%/内存/PID 数值，其余文本）"""
-        tree = self.procs_tree
-        items = [(tree.set(k, col), k) for k in tree.get_children()]
-        if col == "CPU%":
-            items.sort(key=lambda t: float(str(t[0]).replace("%", "") or 0), reverse=True)
-        elif col == "PID":
-            items.sort(key=lambda t: int(t[0]), reverse=True)
-        elif col == "内存":
-            # 按真实字节数排（旧版按字符串排，"900.0M" 会排在 "1.2G" 前面）
-            items.sort(key=lambda t: parse_size(t[0]), reverse=True)
-        else:
-            items.sort()
-        for i, (val, k) in enumerate(items):
-            tree.move(k, "", i)
+        """进程表头点击排序（CPU%/内存/PID 数值降序，其余文本升序）"""
+        parsers = {
+            "CPU%": lambda text: float(str(text).replace("%", "") or 0),
+            "PID": int,
+            "内存": parse_size,   # 按真实字节数排，而不是字符串
+        }
+        key = parsers.get(col)
+        sort_treeview(self.procs_tree, col, key=key, reverse=key is not None)
 
     def _render_star(self, items):
         """启动项卡片流（参照电脑管家样式）：应用图标 + 名称 + 命令副标题
@@ -3842,10 +4336,14 @@ class HardwareModule(BaseModule):
             self.star_count_lbl.config(text="共 0 项")
             return
         row_h = 52
-        visible = min(len(items), 40)
-        c.configure(scrollregion=(0, 0, 0, visible * row_h + 8))
+        # 旧实现只渲染前 40 项：第 41 项起既看不见也点不到开关，而顶部计数
+        # 显示的是总数，用户会以为列表没加载完整。scrollregion 按全量算。
+        c.configure(scrollregion=(0, 0, 0, len(items) * row_h + 8))
         W = c.winfo_width()
-        for i, it in enumerate(items[:40]):
+        # 图标提取在 UI 线程同步执行：给个预算，超出预算的行先显示 🚀，
+        # 避免 100+ 启动项首屏卡住（_PHOTO_CACHE 命中后不受影响）。
+        icon_budget = 60
+        for i, it in enumerate(items):
             name = str(it.get("name", "")) if isinstance(it, dict) else str(it[0])
             val = str(it.get("val", "")) if isinstance(it, dict) else str(it[1])
             disabled = bool(it.get("disabled")) if isinstance(it, dict) else False
@@ -3872,7 +4370,7 @@ class HardwareModule(BaseModule):
             if exe:
                 pkey = (exe.lower(), 28)
                 photo = _PHOTO_CACHE.get(pkey)
-                if photo is None:
+                if photo is None and i < icon_budget:
                     pil = get_file_icon_img(exe, 28)
                     if pil is not None:
                         try:
@@ -3937,48 +4435,67 @@ class HardwareModule(BaseModule):
             show_warning("操作失败", msg)
 
     def _export_report(self):
-        """导出硬件快照报告（系统信息 + 磁盘 + 自启项 + GPU 实时）"""
-        try:
-            lines = [f"{APP_NAME} 硬件报告  {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
-                     "=" * 56, ""]
-            for k, v in get_sys_info().items():
-                lines.append(f"{k}: {v}")
-            up = time.time() - psutil.boot_time()
-            lines.append(f"开机时长: {int(up)//3600} 小时 {(int(up)%3600)//60} 分钟")
-            extra = self._cached_extra or {}
-            for k in ("GPU", "显存", "BIOS", "主板", "磁盘", "安全启动"):
-                v = extra.get(k) if isinstance(extra, dict) else None
-                if v and v not in ("未知", "-"):
+        """导出硬件快照报告（系统信息 + 磁盘 + 自启项 + GPU 实时）。
+
+        缓存未命中时 get_startup()/query_gpu_status() 会起 PowerShell（最长
+        数十秒），旧实现放在按钮回调里直接冻结 UI。改为后台生成 + 主线程弹窗。
+        """
+        if getattr(self, "_report_running", False):
+            show_info("正在生成", "硬件报告正在后台生成，请稍候")
+            return
+        self._report_running = True
+
+        def _work(report):
+            try:
+                lines = [f"{APP_NAME} 硬件报告  {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+                         "=" * 56, ""]
+                for k, v in get_sys_info().items():
                     lines.append(f"{k}: {v}")
-            gpu_now = query_gpu_status()
-            if gpu_now:
-                lines.append(f"GPU 实时: {gpu_now}")
-            lines.append("")
-            lines.append("[磁盘]")
-            for d in (self._cached_disk or get_disks()):
-                lines.append(f"  {d['mount']}  {kb(d['used'])} / {kb(d['total'])}  ({d['percent']}%)")
-            star = self._cached_star or get_startup()
-            lines.append("")
-            lines.append(f"[开机自启] 共 {len(star)} 项")
-            for it in star[:20]:
-                # v2.4 起自启项是字典（旧版元组解包 dict 会抛 too many values）
-                nm = it.get("name", "") if isinstance(it, dict) else str(it[0])
-                lines.append(f"  · {nm}")
-            lines.append("")
-            cpu = psutil.cpu_percent(interval=None)
-            mem = psutil.virtual_memory()
-            lines.append(f"[当前负载] CPU {cpu}% · 内存 {mem.percent}% "
-                         f"({mem.used/1024**3:.1f}/{mem.total/1024**3:.1f}GB)")
-            path = Path.home() / f"硬件报告_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
-            path.write_text("\n".join(lines), encoding="utf-8")
-            show_info("已导出", f"报告已保存到:\n{path}")
-        except Exception as e:
-            show_error("导出失败", str(e))
+                up = time.time() - psutil.boot_time()
+                lines.append(f"开机时长: {int(up)//3600} 小时 {(int(up)%3600)//60} 分钟")
+                extra = self._cached_extra or {}
+                for k in ("GPU", "显存", "BIOS", "主板", "磁盘", "安全启动"):
+                    v = extra.get(k) if isinstance(extra, dict) else None
+                    if v and v not in ("未知", "-"):
+                        lines.append(f"{k}: {v}")
+                gpu_now = query_gpu_status()
+                if gpu_now:
+                    lines.append(f"GPU 实时: {gpu_now}")
+                lines.append("")
+                lines.append("[磁盘]")
+                for d in (self._cached_disk or get_disks()):
+                    lines.append(f"  {d['mount']}  {kb(d['used'])} / {kb(d['total'])}  ({d['percent']}%)")
+                star = self._cached_star or get_startup()
+                lines.append("")
+                lines.append(f"[开机自启] 共 {len(star)} 项")
+                for it in star[:20]:
+                    # v2.4 起自启项是字典（旧版元组解包 dict 会抛 too many values）
+                    nm = it.get("name", "") if isinstance(it, dict) else str(it[0])
+                    lines.append(f"  · {nm}")
+                lines.append("")
+                cpu = psutil.cpu_percent(interval=None)
+                mem = psutil.virtual_memory()
+                lines.append(f"[当前负载] CPU {cpu}% · 内存 {mem.percent}% "
+                             f"({mem.used/1024**3:.1f}/{mem.total/1024**3:.1f}GB)")
+                path = Path.home() / f"硬件报告_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+                path.write_text("\n".join(lines), encoding="utf-8")
+                report(("ok", str(path)))
+            except Exception as e:
+                report(("err", str(e)))
+
+        def _done(message):
+            status, payload = message
+            self._report_running = False
+            if status == "ok":
+                show_info("已导出", f"报告已保存到:\n{payload}")
+            else:
+                show_error("导出失败", payload)
+
+        run_in_background(self.root, _work, _done, interval=200,
+                          alive=lambda: not getattr(self.app, "_closing", False))
 
     def _refresh_procs(self):
         self._q.put(("proc", get_processes()))
-    def _load_star(self):
-        self._q.put(("star", get_startup()))
 
     def _port_dialog(self):
         """端口占用查询：输入端口号精确查，或留空看全部监听端口；可直接结束占用进程"""
@@ -4044,26 +4561,18 @@ class HardwareModule(BaseModule):
         if not win.winfo_exists():
             return
         count_lbl.config(text="查询中…")
-        q = queue.Queue()
 
-        def work():
-            q.put(get_port_usage(port))
-        threading.Thread(target=work, daemon=True).start()
+        def work(report):
+            report(get_port_usage(port))
 
-        def fill():
-            if not win.winfo_exists():
-                return
-            try:
-                rows = q.get_nowait()
-            except queue.Empty:
-                win.after(100, fill)
-                return
+        def fill(rows):
             tree.delete(*tree.get_children())
             for r in rows:
                 tree.insert("", "end", values=(r["proto"], r["local"], r["remote"],
                                                r["state"], r["pid"], r["pname"]))
             count_lbl.config(text=f"共 {len(rows)} 条")
-        win.after(100, fill)
+
+        run_in_background(win, work, fill, interval=100)
 
     def _proc_menu(self, event):
         """进程表右键菜单：结束进程"""
@@ -4283,6 +4792,8 @@ class ClipboardModule(BaseModule):
         self._render_after = None
         self._page_active = False
         self._dirty = False
+        self._save_job = None
+        self._history_dirty = False
         self._closed = False
 
     def _assert_owner(self):
@@ -4308,13 +4819,23 @@ class ClipboardModule(BaseModule):
         r"|\bsk-[A-Za-z0-9]{16,}\b|\bgh[pousr]_[A-Za-z0-9]{20,}\b"
         r"|\bAKIA[0-9A-Z]{16,}\b|\bxox[baprs]-[A-Za-z0-9-]{15,}\b"
         r"|\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\."
-        r"|\b[0-9a-fA-F]{32,64}\b")
+        r"|\b[0-9a-fA-F]{64}\b")
+    # 上下文明确是"哈希/校验值"时不算密钥：复制 MD5/SHA 校验值、git 短哈希
+    # 不该被静默跳过（旧规则 \b[0-9a-fA-F]{32,64}\b 会把它们全判成密钥）
+    _HASH_CTX_RE = re.compile(
+        r"(?i)(?:md5|sha-?[0-9]{1,3}|hash|checksum|digest|哈希|校验|摘要)")
+    _HEX_ANY_RE = re.compile(r"\b[0-9a-fA-F]{32,}\b")
 
     @classmethod
     def _looks_secret(cls, text):
-        """疑似密码/令牌/密钥：启发式判断（键值对、常见平台前缀、JWT、长十六进制）。"""
+        """疑似密码/令牌/密钥：启发式判断（键值对、常见平台前缀、JWT、64 位十六进制）。"""
         if not text:
             return False
+        # getattr 兜底：单元测试只注入 _SECRET_RE/_looks_secret 两个名字
+        ctx = getattr(cls, "_HASH_CTX_RE", None)
+        hex_any = getattr(cls, "_HEX_ANY_RE", None)
+        if ctx is not None and hex_any is not None and ctx.search(text):
+            return bool(cls._SECRET_RE.search(hex_any.sub(" ", text)))
         return bool(cls._SECRET_RE.search(text))
 
     def _drain_captures(self):
@@ -4350,9 +4871,21 @@ class ClipboardModule(BaseModule):
             # 退出清空历史（隐私）：内存、历史文件、图片缓存一起清。
             # 旧版只清了内存和 JSON，截图 PNG 仍留在磁盘上，"清空"名不副实。
             self.history = []
+            self._history_dirty = False
+            if self._save_job is not None:
+                try: self.root.after_cancel(self._save_job)
+                except Exception: pass
+                self._save_job = None
             try: HISTORY_FILE.unlink(missing_ok=True)
             except Exception: pass
             purge_clip_image_cache()
+        else:
+            # 防抖写入可能还挂在 500ms 定时器上：退出前强制落盘
+            if self._save_job is not None:
+                try: self.root.after_cancel(self._save_job)
+                except Exception: pass
+                self._save_job = None
+            self._flush_history()
         self.stop()
         self._closed = True
         self._stop_event.set()
@@ -4447,7 +4980,25 @@ class ClipboardModule(BaseModule):
         return kept
 
     def _save_history(self):
+        """标记待保存；500ms 内的多次变更合并为一次整文件写入。
+
+        旧实现每次捕获都全量序列化 300 条历史（可能几十 MB），高频复制时
+        反复卡住 Tk 主线程。真正落盘由 _flush_history 完成，退出时强制写入。
+        """
         self._assert_owner()
+        self._history_dirty = True
+        if self._save_job is None:
+            try:
+                self._save_job = self.root.after(500, self._flush_history)
+            except Exception:
+                return self._flush_history()   # root 已销毁：只能同步写
+        return True
+
+    def _flush_history(self):
+        self._save_job = None
+        if not self._history_dirty:
+            return True
+        self._history_dirty = False
         self.history = self._normalize_history(self.history)
         try:
             HISTORY_FILE.parent.mkdir(parents=True, exist_ok=True)
@@ -4457,6 +5008,14 @@ class ClipboardModule(BaseModule):
             self._last_save_error = None
         except Exception as exc:
             self._last_save_error = str(exc)
+            self._history_dirty = True          # 下次再试，别把改动丢了
+            # 5s 后重试一次（磁盘满/被杀软锁住等瞬时失败；不重试就要等到
+            # 下次复制或退出才落盘）
+            if self._save_job is None:
+                try:
+                    self._save_job = self.root.after(5000, self._flush_history)
+                except Exception:
+                    pass
             return False
         self._prune_img_cache()
         return True
@@ -4809,19 +5368,12 @@ class ClipboardModule(BaseModule):
         tk.Button(btns, text="✖ 关闭", bg=PANEL2, fg=TEXT2, font=(FONT_UI, 9),
                   bd=0, relief="flat", cursor="hand2", command=win.destroy).pack(side="left", padx=(8, 0))
         copy_btn = btns.winfo_children()[0]
-        q = queue.Queue()
 
-        def _do():
-            q.put(ocr_image_text(path))
+        def _do(report):
+            report(ocr_image_text(path))
 
-        def _poll():
-            if not win.winfo_exists():
-                return
-            try:
-                text, err = q.get_nowait()
-            except queue.Empty:
-                win.after(250, _poll)
-                return
+        def _done(message):
+            text, err = message
             out.config(state="normal")
             if err:
                 status.config(text="识别失败", fg=RED)
@@ -4830,8 +5382,8 @@ class ClipboardModule(BaseModule):
                 status.config(text=f"完成（{len(text)} 字符）", fg=GREEN)
                 out.insert("1.0", text or "（未识别到文字）")
                 copy_btn.config(state="normal")
-        threading.Thread(target=_do, daemon=True).start()
-        win.after(250, _poll)
+
+        run_in_background(win, _do, _done, interval=250)
 
     def _text_tools_dialog(self):
         win = tk.Toplevel(self.root)
@@ -5164,8 +5716,9 @@ class ClipboardModule(BaseModule):
                 if h.get("type") == "img":
                     line += "\n图片缓存路径（不嵌入图片）: " + h.get("img", "")
                 rows.append(line)
-            # Exclusive creation: never silently overwrite an existing export or app data.
-            with Path(path).open("x", encoding="utf-8") as stream:
+            # 保存对话框已经让用户确认过覆盖，这里再用 "x" 独占创建会让
+            # 「覆盖」必然失败（FileExistsError）。显式覆盖才符合 UI 承诺。
+            with Path(path).open("w", encoding="utf-8") as stream:
                 stream.write("\n\n".join(rows))
         except Exception as exc:
             show_error("导出失败", str(exc))
@@ -5230,12 +5783,7 @@ class CleanupModule(BaseModule):
         self._scan_results = []
 
     def _mkbtn(self, parent, text, cmd, color=CYAN):
-        btn = tk.Button(parent, text=text, bg=PANEL2, fg=color,
-                        font=(FONT_UI, 10), bd=0, relief="flat",
-                        cursor="hand2", command=cmd)
-        btn.pack(side="left", padx=(0, 6), pady=4)
-        btn.bind("<Enter>", lambda e=None, b=btn: b.config(bg=PANEL3))
-        btn.bind("<Leave>", lambda e=None, b=btn: b.config(bg=PANEL2))
+        make_secondary_button(parent, text, cmd, color=color, font_size=10)
 
     def _junk_dirs(self):
         """垃圾目录清单：(类别, 路径, 通配pattern, 说明)。
@@ -5399,21 +5947,17 @@ class CleanupModule(BaseModule):
         if getattr(self, '_clean_busy', False):
             return
         self._clean_busy = True
-        q = queue.Queue()
-        def work():
-            q.put(self._delete_clean_jobs(jobs))
-        def poll():
-            try:
-                result = q.get_nowait()
-            except queue.Empty:
-                self.root.after(200, poll)
-                return
+
+        def work(report):
+            report(self._delete_clean_jobs(jobs))
+
+        def done(result):
             self._clean_busy = False
             show_info('完成', '已删除 {count} 个文件 ({bytes} 字节); 跳过 {skipped}; 失败 {failed}'.format(**result))
             if self.list_frame.winfo_exists():
                 self._scan()
-        threading.Thread(target=work, daemon=True).start()
-        self.root.after(200, poll)
+
+        run_in_background(self.root, work, done, interval=200)
 
     def _is_active_file(self, fp):
         """活跃文件豁免：最近 1 小时内修改过的文件视为使用中，跳过不删
@@ -5439,8 +5983,7 @@ class CleanupModule(BaseModule):
         for w in self.list_frame.winfo_children():
             w.destroy()
         self.total_var.set('扫描中...')
-        q = queue.Queue()
-        def work():
+        def work(report):
             results = []
             total = 0
             stats = dict(skipped=0, failed=0)
@@ -5457,21 +6000,16 @@ class CleanupModule(BaseModule):
                     total += size / 1024
             except Exception:
                 stats['failed'] += 1
-            q.put((tuple(results), total, stats))
-        def poll():
-            if self._clean_scan_token is not token or not self.list_frame.winfo_exists():
-                return
-            try:
-                results, total, stats = q.get_nowait()
-            except queue.Empty:
-                self.root.after(200, poll)
-                return
+            report((tuple(results), total, stats))
+        def done(message):
+            results, total, stats = message
             self._scan_results = results
             self._render(total)
             if stats['failed'] or stats['skipped']:
                 self.total_var.set(f"{total:.0f}KB (跳过 {stats['skipped']}; 失败 {stats['failed']})")
-        threading.Thread(target=work, daemon=True).start()
-        self.root.after(200, poll)
+        run_in_background(self.root, work, done, interval=200,
+                          alive=lambda: (self._clean_scan_token is token
+                                         and self.list_frame.winfo_exists()))
 
     def _render(self, total_kb):
         for w in self.list_frame.winfo_children(): w.destroy()
@@ -5530,8 +6068,7 @@ class CleanupModule(BaseModule):
 
     def _flush_dns(self):
         """ipconfig /flushdns：清除 DNS 解析缓存（借鉴 PC Manager 清理项）"""
-        q = queue.Queue()
-        def _do():
+        def _do(report):
             try:
                 si = subprocess.STARTUPINFO()
                 si.dwFlags = subprocess.STARTF_USESHOWWINDOW
@@ -5542,30 +6079,10 @@ class CleanupModule(BaseModule):
                 out = (r.stdout or "").strip() or "已刷新"
             except Exception as e:
                 out = f"执行失败：{e}"
-            q.put(out)
-        threading.Thread(target=_do, daemon=True).start()
+            report(out)
 
-        def _poll():
-            try:
-                out = q.get_nowait()
-            except queue.Empty:
-                self.root.after(200, _poll)
-                return
-            show_info("刷新DNS缓存", out[:200])
-        self.root.after(200, _poll)
-
-    def _sort_results(self, tree, col):
-        """点击表头排序（大小按真实字节数——旧版 KB/MB 去掉单位后裸数字比较
-        会把 900KB 排到 1.5MB 前面；其余按字母）"""
-        items = [(tree.set(k, col), k) for k in tree.get_children()]
-        if col == "大小":
-            items.sort(key=lambda t: parse_size(t[0]), reverse=True)
-        elif col == "文件数":
-            items.sort(key=lambda t: int(t[0]), reverse=True)
-        else:
-            items.sort()
-        for i, (val, k) in enumerate(items):
-            tree.move(k, "", i)
+        run_in_background(self.root, _do,
+                          lambda out: show_info("刷新DNS缓存", out[:200]))
 
     def _ctx_clean(self, event):
         """右键菜单：清理选中类别（不依赖勾选状态）"""
@@ -5757,7 +6274,9 @@ class UninstallModule(BaseModule):
         self._icon_refs = {}
         self._icon_photo = {}   # exe路径 → PhotoImage（跨渲染复用，避免重复创建）
         self._icon_q = queue.Queue()
-        self._icon_gen = 0
+        # 递增而非归零：rebuild 时仍在跑的旧提取线程，其代数必须与新页不同，
+        # 否则旧结果会被当成当前代贴到新列表上（最坏是错位图标）
+        self._icon_gen = getattr(self, "_icon_gen", 0) + 1
         self._sort_col = "名称"
         self._sort_desc = False
         self._last_kw = ""
@@ -5770,32 +6289,20 @@ class UninstallModule(BaseModule):
                                                       self.search_box.icursor("end")) or "break")
         self.search_box.bind("<Return>", lambda e: self._filter())
         self.search_box.bind("<Escape>", lambda e: (self.search_var.set("")))
-        self._drain_icons()   # 图标渐进加载轮询（页面存续期间）
+        self._start_drain()   # 图标渐进加载轮询（页面存续期间，按代隔离）
 
     def _mkbtn(self, parent, text, cmd, color=PURPLE):
-        btn = tk.Button(parent, text=text, bg=PANEL2, fg=color, font=(FONT_UI, 10),
-                        bd=0, relief="flat", cursor="hand2", command=cmd)
-        btn.pack(side="left", padx=(0, 6), pady=4)
-        btn.bind("<Enter>", lambda e=None, b=btn: b.config(bg=PANEL3))
-        btn.bind("<Leave>", lambda e=None, b=btn: b.config(bg=PANEL2))
-        return btn
+        return make_secondary_button(parent, text, cmd, color=color, font_size=10)
 
     def _scan(self):
         token = self._app_scan_token = object()
-        q = queue.Queue()
-        def work():
+        def work(report):
             try:
-                q.put(('ok', self._scan_reg()))
+                report(('ok', self._scan_reg()))
             except Exception as exc:
-                q.put(('error', str(exc)))
-        def poll():
-            if self._app_scan_token is not token:
-                return
-            try:
-                kind, result = q.get_nowait()
-            except queue.Empty:
-                self.root.after(200, poll)
-                return
+                report(('error', str(exc)))
+        def done(message):
+            kind, result = message
             if kind == 'ok':
                 self._all_apps = result
             try:
@@ -5806,8 +6313,8 @@ class UninstallModule(BaseModule):
                         self._cnt.set('扫描失败: ' + result)
             except Exception:
                 pass
-        threading.Thread(target=work, daemon=True).start()
-        self.root.after(200, poll)
+        run_in_background(self.root, work, done, interval=200,
+                          alive=lambda: self._app_scan_token is token)
 
     def _scan_reg(self):
         import winreg
@@ -5923,7 +6430,9 @@ class UninstallModule(BaseModule):
         except Exception:
             return
         tree = self.list_tree
-        sel_apps = {id(a) for a in self._selected_apps()}   # 按应用对象身份保持选中
+        # 用稳定业务键保留选中：_filter 每次都会 dict(a) 复制新对象，
+        # 用 id(a) 永远对不上（旧实现一搜索就把 Ctrl 多选全清空）。
+        sel_keys = {(a["name"], a.get("uninstall", "")) for a in self._selected_apps()}
         yv = tree.yview()
         tree.delete(*tree.get_children())
         self._iid_app = {}
@@ -5951,7 +6460,7 @@ class UninstallModule(BaseModule):
                 tree.item(iid, image=cached)
             elif exe:
                 pending.append((iid, exe))
-            if id(a) in sel_apps:
+            if (a["name"], a.get("uninstall", "")) in sel_keys:
                 tree.selection_add(iid)
         tree.yview_moveto(yv[0])
         # 空态提示（有数据但被筛没）
@@ -5989,7 +6498,19 @@ class UninstallModule(BaseModule):
                 self._icon_q.put(("icon", gen, iid, (exe, pil)))
         self._icon_q.put(("end", gen, None, None))
 
-    def _drain_icons(self):
+    def _start_drain(self):
+        """开启新一代图标消费循环。
+
+        切页会 destroy + build，旧循环挂着的 after 回调若在新 build 之后触发，
+        会看到新的 list_tree 仍然存在并继续续排——多次切页后就有多条 120ms
+        轮询链叠加。用 token 让旧代回调自行退出。
+        """
+        self._drain_token = getattr(self, "_drain_token", 0) + 1
+        self._drain_icons(self._drain_token)
+
+    def _drain_icons(self, token=None):
+        if token is not None and token != getattr(self, "_drain_token", None):
+            return
         try:
             if not self.list_tree.winfo_exists():
                 return   # 页签已切走；回到本页时 build 重启轮询
@@ -6000,8 +6521,8 @@ class UninstallModule(BaseModule):
                 typ, gen, iid, data = self._icon_q.get_nowait()
                 if typ == "end":
                     if gen == self._icon_gen:
-                        return   # 当前轮提取结束
-                    continue   # 旧轮结束标记，继续消费
+                        break    # 本轮结束：跳出 while，但绝不能跳过末尾重新排程
+                    continue     # 旧轮结束标记，继续消费
                 if gen != self._icon_gen:
                     continue   # 过期轮次的结果作废
                 if typ == "pub":
@@ -6027,7 +6548,13 @@ class UninstallModule(BaseModule):
                     pass
         except queue.Empty:
             pass
-        self.root.after(120, self._drain_icons)
+        # 必须无条件续排：搜索/排序开启的新一轮（gen+1）也要有人消费。
+        # 旧实现在当前代 end 时直接 return，之后图标/发布者永久不再更新。
+        try:
+            if self.list_tree.winfo_exists():
+                self.root.after(120, lambda: self._drain_icons(token))
+        except Exception:
+            pass
 
     # ── 选择 / 批量 ──
     def _selected_apps(self):
@@ -6139,7 +6666,6 @@ class UninstallModule(BaseModule):
         log.pack(fill="x", padx=16, pady=(4, 4))
 
         iid_id = {}
-        q = queue.Queue()
         upg = {"running": False}
         querying = {"running": False}
 
@@ -6154,7 +6680,7 @@ class UninstallModule(BaseModule):
                 return
             querying['running'] = True
             status.config(text="正在查询 winget 升级列表…（约 5~20 秒）")
-            def _do():
+            def _do(report):
                 try:
                     si = subprocess.STARTUPINFO()
                     si.dwFlags = subprocess.STARTF_USESHOWWINDOW
@@ -6162,37 +6688,27 @@ class UninstallModule(BaseModule):
                     r = subprocess.run(["winget", "upgrade"], capture_output=True,
                                        text=True, timeout=60, startupinfo=si,
                                        encoding="gbk", errors="ignore")
-                    q.put(("ok", parse_winget_upgrades(r.stdout or "")))
+                    report(("ok", parse_winget_upgrades(r.stdout or "")))
                 except Exception as e:
-                    q.put(("err", str(e)))
-            threading.Thread(target=_do, daemon=True).start()
-            top.after(300, _poll)
+                    report(("err", str(e)))
 
-        def _poll():
-            try:
-                if not top.winfo_exists():
-                    return   # 对话框已关闭
-            except Exception:
-                return
-            try:
-                typ, data = q.get_nowait()
-            except queue.Empty:
-                top.after(300, _poll)
-                return
-            querying["running"] = False
-            if typ == "err":
-                status.config(text=f"查询失败：{data[:120]}")
-                return
-            tree.delete(*tree.get_children())
-            iid_id.clear()
-            for it in data:
-                iid = tree.insert("", "end", text="  " + it["name"][:44],
-                                  values=(it["cur"], it["avail"]))
-                iid_id[iid] = it["id"]
-            if data:
-                status.config(text=f"共 {len(data)} 个可升级 · 选中后点下方按钮（升级需联网，静默模式）")
-            else:
-                status.config(text="✅ 全部软件均为最新，无可升级项 👍")
+            def _done(message):
+                typ, data = message
+                querying["running"] = False
+                if typ == "err":
+                    status.config(text=f"查询失败：{data[:120]}")
+                    return
+                tree.delete(*tree.get_children())
+                iid_id.clear()
+                for it in data:
+                    iid = tree.insert("", "end", text="  " + it["name"][:44],
+                                      values=(it["cur"], it["avail"]))
+                    iid_id[iid] = it["id"]
+                if data:
+                    status.config(text=f"共 {len(data)} 个可升级 · 选中后点下方按钮（升级需联网，静默模式）")
+                else:
+                    status.config(text="✅ 全部软件均为最新，无可升级项 👍")
+            run_in_background(top, _do, _done, interval=300)
         _query()
 
         def _upgrade(targets):
@@ -6208,9 +6724,9 @@ class UninstallModule(BaseModule):
                     f"通过 winget 官方源升级 {len(targets)} 个软件？\n{names}", danger=True):
                 return
             upg["running"] = True
-            def _do():
+            def _do(report):
                 for t in targets:
-                    q2.put(("log", f"—— 升级 {t['id']} ——"))
+                    report(("log", f"—— 升级 {t['id']} ——"))
                     try:
                         si = subprocess.STARTUPINFO()
                         si.dwFlags = subprocess.STARTF_USESHOWWINDOW
@@ -6222,33 +6738,21 @@ class UninstallModule(BaseModule):
                             startupinfo=si, encoding="gbk", errors="ignore")
                         tail = [l for l in (r.stdout or "").splitlines() if l.strip()][-2:]
                         for l in tail:
-                            q2.put(("log", "  " + l.strip()))
-                        q2.put(("log", f"  {'✅ 完成' if r.returncode == 0 else '❌ 失败（码 %d）' % r.returncode}"))
+                            report(("log", "  " + l.strip()))
+                        report(("log", f"  {'✅ 完成' if r.returncode == 0 else '❌ 失败（码 %d）' % r.returncode}"))
                     except Exception as e:
-                        q2.put(("log", f"  ❌ 异常：{e}"))
-                q2.put(("done", None))
-            q2 = queue.Queue()
-            threading.Thread(target=_do, daemon=True).start()
-            def _poll2():
-                try:
-                    if not top.winfo_exists():
-                        return   # 对话框已关闭（升级线程自行结束）
-                except Exception:
+                        report(("log", f"  ❌ 异常：{e}"))
+                report(("done", None))
+            def _done(message):
+                typ, data = message
+                if typ == "log":
+                    _log(data)
                     return
-                try:
-                    typ, data = q2.get_nowait()
-                    if typ == "log":
-                        _log(data)
-                    else:
-                        upg["running"] = False
-                        _log("—— 任务结束，自动重新查询升级列表 ——")
-                        _query()
-                        return
-                except queue.Empty:
-                    pass
-                top.after(400, _poll2)
+                upg["running"] = False
+                _log("—— 任务结束，自动重新查询升级列表 ——")
+                _query()
             _log(f"开始升级 {len(targets)} 项…")
-            _poll2()
+            run_in_background(top, _do, _done, interval=400)
 
         def _sel_targets():
             return [{"id": iid_id[i], "name": tree.item(i, "text").strip()}
@@ -6260,7 +6764,8 @@ class UninstallModule(BaseModule):
                   command=lambda: _upgrade(_sel_targets())).pack(side="left")
         tk.Button(btnf, text="⬆⬆ 全部升级", bg=PANEL2, fg=YELLOW, font=(FONT_UI, 9),
                   bd=0, relief="flat", cursor="hand2",
-                  command=lambda: _upgrade([{"id": i, "name": tree.item(i, "text").strip()}
+                  command=lambda: _upgrade([{"id": iid_id[i],
+                                             "name": tree.item(i, "text").strip()}
                                             for i in iid_id])).pack(side="left", padx=(8, 0))
         tk.Button(btnf, text="🔄 重新查询", bg=PANEL2, fg=CYAN, font=(FONT_UI, 9),
                   bd=0, relief="flat", cursor="hand2",
@@ -6326,34 +6831,29 @@ class UninstallModule(BaseModule):
 
     def _chain_residual_watch(self, app):
         """后台轮询注册表：该应用条目消失（卸载完成）即经队列回主线程询问残留扫描。
-        最多盯 8 分钟；不影响界面（queue+poll 模式）。"""
-        q = queue.Queue()
-        def _do():
+        最多盯 8 分钟；不影响界面（run_in_background 模式）。"""
+        def _do(report):
             name = app["name"]
             for _ in range(240):
                 time.sleep(2)
                 try:
                     if not self._app_in_registry(name):
-                        q.put(("gone", name))
+                        report(("gone", name))
                         return
                 except Exception:
                     return
-            q.put(("timeout", name))
-        threading.Thread(target=_do, daemon=True).start()
+            report(("timeout", name))
 
-        def _poll():
-            try:
-                typ, name = q.get_nowait()
-            except queue.Empty:
-                self.root.after(2000, _poll)
-                return
+        def _done(message):
+            typ, name = message
             if typ != "gone":
                 return
             if ask_yesno("卸载完成",
                     f"检测到 [{name}] 已从系统卸载。\n\n是否立即扫描安装残留？"):
                 self._residual_dialog({"name": name, "uninstall": app.get("uninstall", ""),
                                        "install_dir": app.get("install_dir", "")})
-        self.root.after(2000, _poll)
+        run_in_background(self.root, _do, _done, interval=2000,
+                          alive=lambda: not getattr(self.app, "_closing", False))
 
     def _batch_uninstall(self):
         targets = self._selected_apps()
@@ -6368,42 +6868,134 @@ class UninstallModule(BaseModule):
         if not ask_yesno("确认批量卸载",
                 f"将依次启动 {len(targets)} 个卸载程序：\n{names}{warn}\n\n确认继续？", danger=True):
             return
-        ok = silent = 0
-        for a in targets:
+        # 串行执行：MSI 同时只允许一个安装事务，旧实现把所有卸载器一起
+        # Popen，第二个起就会 1618（另一个安装正在进行），与"依次启动"文案不符。
+        # 放在后台线程里等待，避免 10 分钟级的向导把 UI 冻住。
+        stop_evt = threading.Event()
+
+        def _work(report):
+            ok = silent = 0
+            failed = []
+            for idx, a in enumerate(targets, 1):
+                if stop_evt.is_set():
+                    break
+                report(("progress", idx, a["name"]))
+                try:
+                    cmd, was_silent = _make_silent_uninstall(a["uninstall"])
+                    si = subprocess.STARTUPINFO()
+                    si.dwFlags = subprocess.STARTF_USESHOWWINDOW
+                    si.wShowWindow = 0
+                    proc = subprocess.Popen(cmd, startupinfo=si)
+                    deadline = time.time() + 900
+                    while proc.poll() is None:
+                        if stop_evt.is_set() or time.time() > deadline:
+                            break
+                        time.sleep(0.3)
+                    if proc.poll() is None:
+                        failed.append((a["name"], "卸载向导 15 分钟未结束，已跳过等待"))
+                    ok += 1
+                    if was_silent:
+                        silent += 1
+                except Exception as e:
+                    failed.append((a["name"], str(e)))
+            report(("done", ok, silent, failed))
+
+        top = tk.Toplevel(self.root)
+        top.title("批量卸载")
+        top.configure(bg=BG)
+        top.resizable(False, False)
+        top.transient(self.root)
+        enable_dark_title_bar(top)
+        try: top.grab_set()
+        except Exception: pass
+        tk.Label(top, text="正在依次启动卸载程序…", bg=BG, fg=ORANGE,
+                 font=(FONT_UI, 11, "bold")).pack(padx=24, pady=(18, 4))
+        cur = tk.Label(top, text="", bg=BG, fg=TEXT2, font=(FONT_UI, 9),
+                       width=48, anchor="w")
+        cur.pack(padx=24)
+        bar = ttk.Progressbar(top, mode="determinate",
+                              maximum=max(1, len(targets)), length=380)
+        bar.pack(padx=24, pady=(10, 4))
+        tk.Label(top, text="每个卸载器结束后才启动下一个（避免 MSI 1618 冲突）。\n"
+                           "向导需要手动操作时，请先完成它再继续。",
+                 bg=BG, fg=MUTED, font=(FONT_UI, 8), wraplength=380,
+                 justify="left").pack(padx=24, pady=(0, 8))
+        tk.Button(top, text="停止后续", bg=PANEL2, fg=TEXT2, font=(FONT_UI, 9),
+                  bd=0, relief="flat", cursor="hand2",
+                  command=stop_evt.set).pack(pady=(0, 14))
+
+        def _close_dialog():
+            stop_evt.set()
             try:
-                cmd, was_silent = _make_silent_uninstall(a["uninstall"])
-                si = subprocess.STARTUPINFO()
-                si.dwFlags = subprocess.STARTF_USESHOWWINDOW
-                si.wShowWindow = 0
-                subprocess.Popen(cmd, startupinfo=si)
-                ok += 1
-                if was_silent:
-                    silent += 1
+                top.grab_release()
+                top.destroy()
             except Exception:
                 pass
-        show_info("批量卸载",
-                            f"已启动 {ok}/{len(targets)} 个卸载程序\n"
-                            f"（{silent} 个走静默模式自动完成，其余请在向导中操作）\n\n"
-                            f"卸载完成后会自动询问是否扫描安装残留")
-        self._chain_batch_residual([a["name"] for a in targets])
-        self._scan()
+
+        top.protocol("WM_DELETE_WINDOW", _close_dialog)
+        _center_on(top, self.root)
+
+        def _done(msg):
+            if not top.winfo_exists():
+                stop_evt.set()
+                return
+            if msg[0] == "progress":
+                _, idx, nm = msg
+                bar.config(value=idx - 1)
+                cur.config(text=f"{idx}/{len(targets)}：{str(nm)[:40]}")
+                return
+            _, ok, silent, failed = msg
+            try:
+                top.grab_release()
+                top.destroy()
+            except Exception:
+                pass
+            text = (f"已完成 {ok}/{len(targets)} 个卸载器\n"
+                    f"（{silent} 个走静默模式自动完成，其余请在向导中操作）\n\n"
+                    f"卸载完成后会自动询问是否扫描安装残留")
+            if failed:
+                text += "\n\n未完成：\n" + "\n".join(
+                    f"  · {n}：{r}" for n, r in failed[:6])
+                show_warning("批量卸载", text)
+            else:
+                show_info("批量卸载", text)
+            self._chain_batch_residual([a["name"] for a in targets])
+            self._scan()
+
+        def _alive():
+            try:
+                if top.winfo_exists():
+                    return True
+            except Exception:
+                pass
+            stop_evt.set()
+            return False
+
+        run_in_background(self.root, _work, _done, interval=200, alive=_alive)
 
     def _chain_batch_residual(self, names):
-        """批量卸载聚合监视：每个名字独立轮询注册表（最多 8 分钟），
-        条目消失即上报；主线程聚合后等 10 秒静默期（静默卸载常成批完成），
-        再统一询问一次是否扫描残留——避免逐个弹窗轰炸。"""
-        q = queue.Queue()
-        for name in names:
-            def _do(n=name):
-                for _ in range(160):
-                    time.sleep(3)
+        """批量卸载聚合监视：单线程轮询注册表（最多 8 分钟），条目消失即上报；
+        主线程聚合后等 10 秒静默期（静默卸载常成批完成），再统一询问一次
+        是否扫描残留——避免逐个弹窗轰炸。"""
+        pending = list(dict.fromkeys(names))
+
+        def _do(report):
+            # 旧实现每个名字一条线程（20 个软件 = 20 条线程 × 每 3s 读一次
+            # 注册表）。合并成一条线程后查询频率不变，线程数恒定。
+            for _ in range(160):
+                time.sleep(3)
+                if not pending:
+                    return
+                still = []
+                for n in list(pending):
                     try:
-                        if not self._app_in_registry(n):
-                            q.put(("gone", n))
-                            return
+                        if self._app_in_registry(n):
+                            still.append(n)
+                        else:
+                            report(("gone", n))
                     except Exception:
-                        return
-            threading.Thread(target=_do, daemon=True).start()
+                        still.append(n)   # 单次读取失败不代表已卸载，下轮再试
+                pending[:] = still
 
         state = {"got": [], "timer": None}
         deadline = time.time() + 600
@@ -6422,25 +7014,19 @@ class UninstallModule(BaseModule):
                 for n in gone:
                     self._residual_dialog({"name": n, "uninstall": "", "install_dir": ""})
 
-        def _poll():
-            arrived = False
-            try:
-                while True:
-                    typ, name = q.get_nowait()
-                    if typ == "gone" and name not in state["got"]:
-                        state["got"].append(name)
-                        arrived = True
-            except queue.Empty:
-                pass
-            if arrived:
+        def _handle(message):
+            typ, name = message
+            if typ == "gone" and name not in state["got"]:
+                state["got"].append(name)
                 # 10s 静默期：期间有新完成的项则顺延，之后统一询问
                 if state["timer"]:
                     try: self.root.after_cancel(state["timer"])
                     except Exception: pass
                 state["timer"] = self.root.after(10000, _ask)
-            if time.time() < deadline:
-                self.root.after(2000, _poll)
-        self.root.after(2000, _poll)
+
+        if pending:
+            run_in_background(self.root, _do, _handle, interval=2000,
+                              alive=lambda: time.time() < deadline)
 
     # ─── 残留扫描（借鉴 Revo：卸载后独立扫描 AppData/ProgramData/注册表）───
     _RESIDUAL_ENV_ROOTS = ("APPDATA", "LOCALAPPDATA", "PROGRAMDATA")
@@ -6557,28 +7143,21 @@ class UninstallModule(BaseModule):
         scan_state = {'token': None}
         def _do_scan():
             token = scan_state['token'] = object()
-            q = queue.Queue()
             status.config(text='正在验证应用专属安装目录…')
             snapshot = dict(app_)
-            def work():
+            def work(report):
                 try:
-                    q.put(('ok', self._scan_residuals(snapshot)))
+                    report(('ok', self._scan_residuals(snapshot)))
                 except Exception as exc:
-                    q.put(('error', str(exc)))
-            def poll():
-                if scan_state['token'] is not token or not top.winfo_exists():
-                    return
-                try:
-                    kind, data = q.get_nowait()
-                except queue.Empty:
-                    top.after(150, poll)
-                    return
+                    report(('error', str(exc)))
+            def done(message):
+                kind, data = message
                 if kind == 'ok':
                     _fill(data)
                 else:
                     status.config(text='扫描失败: ' + data)
-            threading.Thread(target=work, daemon=True).start()
-            top.after(150, poll)
+            run_in_background(top, work, done, interval=150,
+                              alive=lambda: scan_state['token'] is token)
         _do_scan()
 
         def _select_all():
@@ -6692,7 +7271,6 @@ class UninstallModule(BaseModule):
         btnf = tk.Frame(top, bg=BG)
         btnf.pack(fill="x", padx=16, pady=(6, 12))
         all_apps = []
-        scan_res = {}     # 后台线程写入，主线程 _poll 读取
         scan_seq = [0]    # 旧扫描迟到时凭 seq 弃用，防旧结果覆盖新扫描
 
         def _refill(*_a):
@@ -6705,13 +7283,13 @@ class UninstallModule(BaseModule):
         kw_var.trace_add("write", _refill)
 
         def _do_scan():
-            # 扫描在 daemon 线程跑；结果写 scan_res，由主线程 _poll 回填 UI。
+            # 扫描在 daemon 线程跑，结果经 run_in_background 回主线程。
             # 不能在后台线程调 top.after —— Tk 的 after 非线程安全，
             # 主循环忙时会抛 "main thread is not in main loop" 且线程静默死亡。
             scan_seq[0] += 1
             seq = scan_seq[0]
             status.config(text="正在枚举 Appx 包…")
-            def work():
+            def work(report):
                 try:
                     script = ("Get-AppxPackage | Where-Object { -not $_.IsFramework } | "
                               "ForEach-Object { $_.DisplayName + \"`t\" + $_.PackageFullName }")
@@ -6723,27 +7301,22 @@ class UninstallModule(BaseModule):
                         capture_output=True, text=True, timeout=45, startupinfo=si,
                         encoding="utf-8", errors="ignore")
                     apps = self._parse_uwp_lines(r.stdout)
+                    err = ""
                 except Exception as e:
                     apps = []
                     err = str(e)
-                else:
-                    err = ""
-                scan_res["apps"], scan_res["err"], scan_res["seq"] = apps, err, seq
-            threading.Thread(target=work, daemon=True).start()
-            def _poll():
-                if not top.winfo_exists():
-                    return                     # 窗口已关，放弃
-                if scan_res.get("seq") != seq:
-                    top.after(200, _poll)      # 未完成或已被新一轮扫描取代
-                    return
+                report((apps, err))
+            def done(message):
                 nonlocal all_apps
-                all_apps = scan_res["apps"]
+                apps, err = message
+                all_apps = apps
                 _refill()
-                if scan_res["err"]:
-                    status.config(text=f"枚举失败：{scan_res['err'][:120]}")
+                if err:
+                    status.config(text=f"枚举失败：{err[:120]}")
                 else:
                     status.config(text=f"共 {len(all_apps)} 个 UWP 应用（未含框架组件）")
-            top.after(200, _poll)
+            run_in_background(top, work, done, interval=200,
+                              alive=lambda: scan_seq[0] == seq)
 
         def _remove_selected():
             sel = tree.selection()
@@ -6766,9 +7339,8 @@ class UninstallModule(BaseModule):
             ok_msg = {"n": 0, "total": len(targets)}
             # 卸载在 daemon 线程逐个跑（每个最长 120s）；主线程轮询进度。
             # 原先在主线程 for 循环 subprocess.run：选 N 个包 UI 卡死最长 N×120 秒。
-            q = queue.Queue()
             btn_remove.config(state="disabled")
-            def work():
+            def work(report):
                 done = 0
                 for pkg in targets:
                     try:
@@ -6783,25 +7355,17 @@ class UninstallModule(BaseModule):
                         done += 1
                     except Exception:
                         pass
-                    q.put(("prog", done))
-                q.put(("done", done))
-            threading.Thread(target=work, daemon=True).start()
-            def _poll():
-                if not top.winfo_exists():
-                    return
-                try:
-                    kind, val = q.get_nowait()
-                except queue.Empty:
-                    top.after(250, _poll)
-                    return
+                    report(("prog", done))
+                report(("done", done))
+            def done(message):
+                kind, val = message
                 if kind == "prog":
                     status.config(text=f"正在卸载 {val}/{ok_msg['total']} …")
-                    top.after(250, _poll)
                     return
                 btn_remove.config(state="normal")
                 show_info("完成", f"已卸载 {val}/{ok_msg['total']} 个", parent=top)
                 _do_scan()
-            top.after(250, _poll)
+            run_in_background(top, work, done, interval=250)
 
         btn_remove = self._mkbtn(btnf, "🗑 卸载选中", _remove_selected, color=RED)
         self._mkbtn(btnf, "🔄 刷新", _do_scan)
@@ -6815,9 +7379,25 @@ class UninstallModule(BaseModule):
 class FileModule(BaseModule):
     name = "files"; label = "文件洞察"; icon = "📁"; color = YELLOW
 
-    # 删除禁区：系统目录一律拒绝（宁可误拒不可误删）
-    _FORBIDDEN_PREFIXES = ("c:\\windows", "c:\\program files", "c:\\program files (x86)",
-                           "c:\\programdata")
+    # 删除禁区：系统目录一律拒绝（宁可误拒不可误删）。
+    # 用环境变量解析（系统盘不一定是 C:）；比较时补足末尾分隔符，
+    # 避免 C:\WindowsOld / C:\Program FilesBackup 被 startswith 误伤。
+    @staticmethod
+    def _forbidden_prefixes():
+        candidates = [os.environ.get(k) for k in
+                      ("SystemRoot", "ProgramFiles", "ProgramFiles(x86)", "ProgramData")]
+        candidates += [r"C:\Windows", r"C:\Program Files",
+                       r"C:\Program Files (x86)", r"C:\ProgramData"]
+        out = []
+        for p in candidates:
+            if not p:
+                continue
+            try:
+                p = os.path.normcase(os.path.realpath(p))
+            except Exception:
+                continue
+            out.append(p.rstrip("\\") + "\\")
+        return tuple(dict.fromkeys(out))
 
     def build(self):
         body = self.body
@@ -6868,12 +7448,7 @@ class FileModule(BaseModule):
         self._scanning = False
 
     def _mkbtn(self, parent, text, cmd, color=YELLOW):
-        btn = tk.Button(parent, text=text, bg=PANEL2, fg=color,
-                        font=(FONT_UI, 10), bd=0, relief="flat",
-                        cursor="hand2", command=cmd)
-        btn.pack(side="left", padx=(0, 6), pady=4)
-        btn.bind("<Enter>", lambda e=None, b=btn: b.config(bg=PANEL3))
-        btn.bind("<Leave>", lambda e=None, b=btn: b.config(bg=PANEL2))
+        make_secondary_button(parent, text, cmd, color=color, font_size=10)
 
     def _pick_dir(self):
         from tkinter import filedialog
@@ -6887,11 +7462,32 @@ class FileModule(BaseModule):
         except Exception:
             pass
 
+    _SKIP_WALK_DIRS = {"$recycle.bin", "system volume information",
+                       "recovery", "windows.old"}
+
+    @staticmethod
+    def _is_fs_link(path):
+        """junction / symlink 目录：os.walk 不跟符号链接，但 junction 会绕圈。"""
+        try:
+            st = os.lstat(path)
+        except OSError:
+            return False
+        # IO_REPARSE_TAG_MOUNT_POINT / IO_REPARSE_TAG_SYMLINK
+        return getattr(st, "st_reparse_tag", 0) in (0xA0000003, 0xA000000C)
+
     def _walk_files(self, root_dir):
-        """遍历目录产出 (path, size, mtime)，跳过无权限/符号链接循环"""
+        """遍历目录产出 (path, size, mtime)，可被 stop() 中断，跳过链接循环。"""
+        stop = getattr(self, "_scan_stop", None)
         for r, dirs, files in os.walk(root_dir):
-            dirs[:] = [d for d in dirs if not d.startswith(".")]
+            if stop is not None and stop.is_set():
+                return
+            dirs[:] = [d for d in dirs
+                       if not d.startswith(".")
+                       and d.lower() not in self._SKIP_WALK_DIRS
+                       and not self._is_fs_link(os.path.join(r, d))]
             for f in files:
+                if stop is not None and stop.is_set():
+                    return
                 fp = os.path.join(r, f)
                 try:
                     st = os.stat(fp)
@@ -6914,40 +7510,41 @@ class FileModule(BaseModule):
             show_warning("目录无效", f"目录不存在：\n{root_dir}")
             return
         self._scanning = True
+        self._scan_stop = threading.Event()
         self._set_status(f"扫描{title}中…")
-        q = queue.Queue()
-        def _do():
+        def _do(report):
             try:
-                q.put(("ok", worker(root_dir)))
+                report(("ok", worker(root_dir)))
             except Exception as e:
-                q.put(("err", str(e)))
-        threading.Thread(target=_do, daemon=True).start()
+                report(("err", str(e)))
 
-        def _poll():
+        def _done(message):
+            typ, data = message
             if not self.tree.winfo_exists():
                 self._scanning = False
                 return   # 页签已切走
-            try:
-                typ, data = q.get_nowait()
-            except queue.Empty:
-                self.root.after(200, _poll)
-                return
             if typ == "err":
                 self._set_status(f"扫描失败：{data}")
                 self._scanning = False
                 return
             self._render_rows(title, data)
-        self.root.after(200, _poll)
+
+        run_in_background(self.root, _do, _done, interval=200)
 
     def _do_scan_big(self, root_dir):
-        files = list(self._walk_files(root_dir))
-        files.sort(key=lambda x: x[1], reverse=True)
-        return [("big", fp, sz, mt, "") for fp, sz, mt in files[:200]]
+        import heapq
+        # 旧实现 list() 全量入内存再排序：百万文件目录会占数百 MB。
+        # 只需要前 200 个，用 nlargest 保持 O(N log 200) 的常量内存。
+        top = heapq.nlargest(200, self._walk_files(root_dir), key=lambda x: x[1])
+        return [("big", fp, sz, mt, "") for fp, sz, mt in top]
 
     def _do_scan_dup(self, root_dir):
+        stop = getattr(self, "_scan_stop", None)
         # 第一级：按大小分组（>1MB 才参与，避免海量小文件）
         by_size = {}
         for fp, sz, mt in self._walk_files(root_dir):
+            if stop is not None and stop.is_set():
+                return []
             if sz >= 1024 * 1024:
                 by_size.setdefault(sz, []).append((fp, mt))
         cand = {sz: lst for sz, lst in by_size.items() if len(lst) > 1}
@@ -6956,6 +7553,8 @@ class FileModule(BaseModule):
         # 仅采样撞车的文件才做第三级全量 md5——大目录提速一个量级
         group_no = 0
         for sz, lst in sorted(cand.items(), reverse=True):
+            if stop is not None and stop.is_set():
+                break
             if len(lst) > 1:
                 by_quick = {}
                 for fp, mt in lst:
@@ -6965,6 +7564,8 @@ class FileModule(BaseModule):
                 lst = [f for fl in by_quick.values() if len(fl) > 1 for f in fl]
             by_hash = {}
             for fp, mt in lst:
+                if stop is not None and stop.is_set():
+                    break
                 h = self._md5(fp)
                 if h:
                     by_hash.setdefault(h, []).append((fp, mt))
@@ -7028,13 +7629,10 @@ class FileModule(BaseModule):
             self._set_status(f"最大 200 个文件，合计 {kb(sum(sz for _, _, sz, _, _ in rows))}")
 
     def _sort(self, col):
-        items = [(self.tree.set(k, col), k) for k in self.tree.get_children()]
         if col == "大小":
-            items.sort(key=lambda t: parse_size(t[0]), reverse=True)
+            sort_treeview(self.tree, col, key=parse_size, reverse=True)
         else:
-            items.sort()
-        for i, (val, k) in enumerate(items):
-            self.tree.move(k, "", i)
+            sort_treeview(self.tree, col)
 
     # ─── 批量重命名（v3.6）：规则 → 预览 → 执行 → 可撤销 ───
     def _rename_dialog(self):
@@ -7242,9 +7840,10 @@ class FileModule(BaseModule):
         if not paths:
             return
         # 禁区校验
+        forbidden = self._forbidden_prefixes()
         for fp in paths:
-            rp = os.path.realpath(fp).lower()
-            if any(rp.startswith(p) for p in self._FORBIDDEN_PREFIXES):
+            rp = os.path.normcase(os.path.realpath(fp))
+            if any(rp.startswith(p) for p in forbidden):
                 show_error("安全拦截", f"系统目录内文件不允许删除：\n{fp}")
                 return
         total = sum((os.path.getsize(p) for p in paths if os.path.exists(p)), 0)
@@ -7264,7 +7863,13 @@ class FileModule(BaseModule):
             show_error("删除失败", "回收站操作失败，请检查文件是否被占用")
 
     def start(self): pass
-    def stop(self): pass
+
+    def stop(self):
+        # 切页/退出时让后台遍历尽快收尾，别让全盘哈希继续占用磁盘 I/O
+        ev = getattr(self, "_scan_stop", None)
+        if ev is not None:
+            ev.set()
+
     def on_show(self): pass
 
 
@@ -7307,12 +7912,7 @@ class LaunchModule(BaseModule):
         self._render()
 
     def _mkbtn(self, parent, text, cmd, color=GREEN):
-        btn = tk.Button(parent, text=text, bg=PANEL2, fg=color,
-                        font=(FONT_UI, 10), bd=0, relief="flat",
-                        cursor="hand2", command=cmd)
-        btn.pack(side="left", padx=(0, 6), pady=4)
-        btn.bind("<Enter>", lambda e=None, b=btn: b.config(bg=PANEL3))
-        btn.bind("<Leave>", lambda e=None, b=btn: b.config(bg=PANEL2))
+        make_secondary_button(parent, text, cmd, color=color, font_size=10)
 
     def _load(self):
         try:
@@ -7325,12 +7925,16 @@ class LaunchModule(BaseModule):
             self.items = list(self.DEFAULTS)
 
     def _save(self):
+        """原子写入：先写临时文件再 replace，崩溃/断电不会留下半个 JSON。"""
         try:
-            self.LAUNCH_FILE.write_text(
-                json.dumps(self.items, ensure_ascii=False, indent=1),
-                encoding="utf-8")
-        except Exception:
-            pass
+            self.LAUNCH_FILE.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self.LAUNCH_FILE.with_suffix(".json.tmp")
+            tmp.write_text(json.dumps(self.items, ensure_ascii=False, indent=1),
+                           encoding="utf-8")
+            tmp.replace(self.LAUNCH_FILE)
+        except Exception as e:
+            # 旧实现静默 pass：用户改完启动项以为保存成功，重启才发现丢了
+            show_error("保存失败", f"自定义启动项未能保存：\n{e}")
 
     def _render(self):
         for w in self.grid.winfo_children():
@@ -7529,23 +8133,16 @@ class ActivationModule(BaseModule):
         task = self._scan_task = object()
         self._scanning = True
         self._refresh_btn.config(state='disabled', text='查询中…')
-        q = queue.Queue()
-        def work():
+        def work(report):
             try:
                 win = query_windows_activation(force=True)
                 perm, detail = is_permanent_activated(slmgr_xpr_text())
                 office, store = query_office_activation(force=True)
-                q.put(('ok', (win, perm, detail, office, store)))
+                report(('ok', (win, perm, detail, office, store)))
             except Exception as exc:
-                q.put(('err', str(exc)))
-        def poll():
-            if not self._view_live(token) or self._scan_task is not task:
-                return
-            try:
-                kind, data = q.get_nowait()
-            except queue.Empty:
-                self.root.after(300, poll)
-                return
+                report(('err', str(exc)))
+        def done(message):
+            kind, data = message
             self._scanning = False
             self._scan_task = None
             self._refresh_btn.config(state='normal', text='刷新')
@@ -7556,8 +8153,8 @@ class ActivationModule(BaseModule):
                     w.destroy()
                 tk.Label(self.win_card, text='查询失败：' + data, bg=PANEL,
                          fg=RED).pack(anchor='w', padx=12, pady=14)
-        threading.Thread(target=work, daemon=True).start()
-        self.root.after(300, poll)
+        run_in_background(self.root, work, done, interval=300,
+                          alive=lambda: self._view_live(token) and self._scan_task is task)
 
     def _render(self, win, perm, perm_txt, office, store):
         self._scanning = False
@@ -7692,26 +8289,18 @@ class ActivationModule(BaseModule):
 
     def _export_activation_report(self):
         token = self._view_token
-        def _do():
+        def _do(report):
             try:
                 win = query_windows_activation()
                 xpr = slmgr_xpr_text()
                 _, perm_txt = is_permanent_activated(xpr)
                 office, store = query_office_activation()
-                q.put(("ok", (win, perm_txt, office, store)))
+                report(("ok", (win, perm_txt, office, store)))
             except Exception as e:
-                q.put(("err", str(e)))
-        q = queue.Queue()
-        threading.Thread(target=_do, daemon=True).start()
+                report(("err", str(e)))
 
-        def _poll():
-            if not self._view_live(token):
-                return
-            try:
-                typ, data = q.get_nowait()
-            except queue.Empty:
-                self.root.after(300, _poll)
-                return
+        def _done(message):
+            typ, data = message
             if typ == "err":
                 show_error("导出失败", data)
                 return
@@ -7736,7 +8325,9 @@ class ActivationModule(BaseModule):
             path = Path.home() / f"激活报告_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
             path.write_text("\n".join(lines), encoding="utf-8")
             show_info("已导出", f"报告已保存到:\n{path}")
-        self.root.after(300, _poll)
+
+        run_in_background(self.root, _do, _done, interval=300,
+                          alive=lambda: self._view_live(token))
 
     def start(self):
         self._view_active = True
@@ -7766,20 +8357,13 @@ class ActivationModule(BaseModule):
             return
         self._activating = True
         token = self._view_token
-        q = queue.Queue()
-        def work():
+        def work(report):
             try:
-                q.put(self._activation_command(key))
+                report(self._activation_command(key))
             except Exception as exc:
-                q.put(('error', str(exc)))
-        def poll():
-            if getattr(self.app, '_closing', False):
-                return
-            try:
-                kind, detail = q.get_nowait()
-            except queue.Empty:
-                self.root.after(300, poll)
-                return
+                report(('error', str(exc)))
+        def done(message):
+            kind, detail = message
             self._activating = False
             if not self._view_live(token):
                 return
@@ -7790,8 +8374,8 @@ class ActivationModule(BaseModule):
             else:
                 show_warning('激活执行失败', detail[:600])
             self._scan()
-        threading.Thread(target=work, daemon=True).start()
-        self.root.after(300, poll)
+        run_in_background(self.root, work, done, interval=300,
+                          alive=lambda: not getattr(self.app, '_closing', False))
 
     @staticmethod
     def _activation_command(key):
@@ -7906,15 +8490,22 @@ class SetupModule(BaseModule):
                 f"将修改 {len(changes)} 项系统隐私设置？\n{summary}\n\n"
                 f"均为微软文档化的用户级设置，可随时回来勾掉还原。", danger=True):
             return
+        failed = []
         for tid, off in changes:
-            privacy_toggle_apply(tid, off)
+            failed.extend(privacy_toggle_apply(tid, off))
         for tid, var in self._pv_vars.items():
             var.set(privacy_toggle_state(tid))
-        show_info("已应用", f"已更新 {len(changes)} 项隐私设置并即时生效")
+        if failed:
+            show_warning("部分未生效",
+                         f"已更新 {len(changes)} 项，但 {len(failed)} 处注册表写入失败"
+                         "（可能需要管理员权限，或该项已被策略锁定）。\n\n"
+                         "界面已按实际状态回读，未生效的项仍显示原状态。")
+        else:
+            show_info("已应用", f"已更新 {len(changes)} 项隐私设置并即时生效")
 
     # ── 交付报告 ──
     def _export_delivery(self):
-        def _do():
+        def _do(report):
             try:
                 info = get_sys_info()
                 extra = get_extra_info()
@@ -7922,18 +8513,12 @@ class SetupModule(BaseModule):
                 xpr = slmgr_xpr_text()
                 _, perm_txt = is_permanent_activated(xpr)
                 office, store = query_office_activation()
-                q.put(("ok", (info, extra, win, perm_txt, office, store)))
+                report(("ok", (info, extra, win, perm_txt, office, store)))
             except Exception as e:
-                q.put(("err", str(e)))
-        q = queue.Queue()
-        threading.Thread(target=_do, daemon=True).start()
+                report(("err", str(e)))
 
-        def _poll():
-            try:
-                typ, data = q.get_nowait()
-            except queue.Empty:
-                self.root.after(300, _poll)
-                return
+        def _done(message):
+            typ, data = message
             if typ == "err":
                 show_error("生成失败", data)
                 return
@@ -7985,7 +8570,7 @@ class SetupModule(BaseModule):
             path = Path.home() / f"新机交付报告_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
             path.write_text("\n".join(lines), encoding="utf-8")
             show_info("已生成", f"交付报告已保存到:\n{path}")
-        self.root.after(300, _poll)
+        run_in_background(self.root, _do, _done, interval=300)
 
 
 # ═══════════════════════════════════════════
@@ -8083,7 +8668,6 @@ class SpaceModule(BaseModule):
         tree.pack(side="left", fill="both", expand=True)
         alive = {"v": True}
         win.protocol("WM_DELETE_WINDOW", lambda: (alive.update(v=False), win.destroy()))
-        q = queue.Queue()
 
         def _browse():
             from tkinter import filedialog
@@ -8108,26 +8692,19 @@ class SpaceModule(BaseModule):
                 show_warning("路径无效", "目录不存在：" + NL + (path or "（空）"), parent=win)
                 return
             status.config(text="扫描中…", fg=TEXT2)
-            def _do():
+            def _do(report):
                 try:
-                    q.put(("ok", find_empty_dirs([path], stop=lambda: not alive["v"])))
+                    report(("ok", find_empty_dirs([path], stop=lambda: not alive["v"])))
                 except Exception as e:
-                    q.put(("err", str(e)))
-            threading.Thread(target=_do, daemon=True).start()
-            def _poll():
-                try:
-                    typ, data = q.get_nowait()
-                except queue.Empty:
-                    if win.winfo_exists():
-                        win.after(250, _poll)
-                    return
-                if not win.winfo_exists():
-                    return
+                    report(("err", str(e)))
+            def _done(message):
+                typ, data = message
                 if typ == "err":
                     status.config(text="扫描失败：" + data[:70], fg=RED)
                     return
                 _fill(data)
-            win.after(250, _poll)
+            run_in_background(win, _do, _done, interval=250,
+                              alive=lambda: alive["v"])
 
         def _select_all():
             tree.selection_set(tree.get_children())
@@ -8237,8 +8814,6 @@ class SpaceModule(BaseModule):
             state["items"] = items
             state["total"] = total
             # 面包屑：D:\a\b\c → 可点分段
-            crumb.unbind("<Button-1>")
-            crumb.bind("<Button-1>", lambda e: None)
             drive, rest = os.path.splitdrive(path)
             segs = [p for p in rest.split(os.sep) if p]
             crumb.config(text=(drive + os.sep if drive else "") +
@@ -8258,7 +8833,11 @@ class SpaceModule(BaseModule):
             for it, (rx, ry, rw, rh) in zip(big, rects):
                 if rw < 4 or rh < 4:
                     continue
-                col = self._TM_PALETTE[abs(hash(it["name"])) % len(self._TM_PALETTE)]
+                # 用稳定哈希取色：Python 的 hash(str) 每个进程随机化，
+                # 旧实现每次启动同一目录颜色都不同
+                _h = int.from_bytes(hashlib.sha1(
+                    it["name"].encode("utf-8", "replace")).digest()[:4], "big")
+                col = self._TM_PALETTE[_h % len(self._TM_PALETTE)]
                 rid = cv.create_rectangle(rx + pad/2, ry + pad/2, rx + rw - pad/2,
                                           ry + rh - pad/2, fill=col, outline=PANEL2)
                 label = it["name"]
@@ -8303,28 +8882,15 @@ class SpaceModule(BaseModule):
             cv.delete("all")
             cv.create_text(cv.winfo_width() // 2 or 440, 240,
                            text="扫描中…", fill=MUTED, font=(FONT_UI, 10))
-            q = queue.Queue()
-
-            def _do():
+            def _do(report):
                 try:
                     items, total, truncated = scan_dir_sizes(path, budget=10.0, top_n=80)
-                    q.put((items, total, truncated, path, None))
+                    report((items, total, truncated, path, None))
                 except Exception as e:
-                    q.put((None, 0, False, path, str(e)))
+                    report((None, 0, False, path, str(e)))
 
-            threading.Thread(target=_do, daemon=True).start()
-
-            def _poll():
-                try:
-                    if not win.winfo_exists():
-                        return   # 对话框已关闭（扫描线程会自行结束）
-                except Exception:
-                    return
-                try:
-                    items, total, truncated, p, err = q.get_nowait()
-                except queue.Empty:
-                    win.after(200, _poll)
-                    return
+            def _done(message):
+                items, total, truncated, p, err = message
                 state["scanning"] = False
                 if err:
                     status.config(text="扫描失败：" + err, fg=RED)
@@ -8342,7 +8908,7 @@ class SpaceModule(BaseModule):
                          + ("（已达展示上限，仅前 60 项）" if truncated else ""),
                     fg=ORANGE if truncated else TEXT2)
 
-            win.after(200, _poll)
+            run_in_background(win, _do, _done, interval=200)
 
         def _up():
             if len(state["stack"]) >= 2:
@@ -8355,12 +8921,10 @@ class SpaceModule(BaseModule):
             if state["stack"]:
                 _scan_dir(state["stack"][0])
 
-        # 回车 = 扫描输入的路径
-        for w2 in (path_var,):
-            w2.trace_add("write", lambda *a: None)  # 占位，防止误触发
-        cv.bind_all("<Return>", lambda e: _scan_dir(path_var.get().strip().strip('"')))
-        win.protocol("WM_DELETE_WINDOW",
-                     lambda: (cv.unbind_all("<Return>"), win.destroy()))
+        # 回车 = 扫描输入的路径（只绑本窗口：bind_all 会在对话框开着时
+        # 劫持整个应用的回车键）
+        win.bind("<Return>", lambda e: _scan_dir(path_var.get().strip().strip('"')))
+        win.protocol("WM_DELETE_WINDOW", win.destroy)
 
         btns = tk.Frame(win, bg=BG)
         btns.pack(fill="x", padx=16, pady=(4, 12))
@@ -8413,7 +8977,7 @@ class SpaceModule(BaseModule):
 
         holder = tk.Frame(win, bg=BG)
         holder.pack(fill="both", expand=True, padx=16, pady=(6, 4))
-        cols = (("类型", 50), ("路径", 560), ("所在目录", 130))
+        cols = (("类型", 50), ("名称", 560), ("所在目录", 130))
         tree = ttk.Treeview(holder, columns=[c[0] for c in cols], show="headings")
         vs = ttk.Scrollbar(holder, orient="vertical", command=tree.yview)
         tree.configure(yscrollcommand=vs.set)
@@ -8613,7 +9177,6 @@ class SpaceModule(BaseModule):
         status = tk.Label(top, text="粘入完整文件路径 → 查询", bg=BG, fg=TEXT2,
                           font=(FONT_MONO, 8), anchor="w")
         status.pack(fill="x", padx=16)
-        q = queue.Queue()
         holder = tk.Frame(top, bg=BG)
         holder.pack(fill="both", expand=True, padx=16, pady=(4, 4))
         tree = ttk.Treeview(holder, columns=("类型", "状态"), show="tree headings",
@@ -8631,6 +9194,7 @@ class SpaceModule(BaseModule):
         tree.tag_configure("ok", foreground=GREEN)
         tree.tag_configure("warn", foreground=RED)
         iid_pid = {}
+        querying = {"v": False}
 
         def _fill(locks, err):
             tree.delete(*tree.get_children())
@@ -8648,30 +9212,24 @@ class SpaceModule(BaseModule):
                 iid_pid[iid] = l["pid"]
 
         def _query():
+            if querying["v"]:
+                return          # 连点"查询"会并发多个线程/多条 _poll 链，结果互相插队
             path = var.get().strip().strip('"')
             if not os.path.isfile(path):
                 show_warning("路径无效", "文件不存在：" + NL + (path or "（空）"), parent=top)
                 return
+            querying["v"] = True
             status.config(text="查询中…")
-            def _do():
-                q.put(find_file_locks(path))
-            threading.Thread(target=_do, daemon=True).start()
-            def _poll():
-                try:
-                    if not top.winfo_exists():
-                        return   # 对话框已关闭（查询线程会自行结束）
-                except Exception:
-                    return
-                try:
-                    locks, err = q.get_nowait()
-                except queue.Empty:
-                    top.after(250, _poll)
-                    return
+            def _do(report):
+                report(find_file_locks(path))
+            def _done(message):
+                locks, err = message
+                querying["v"] = False
                 _fill(locks, err)
                 n = len(locks)
                 status.config(text=(f"查询完成：{n} 个占用进程" if n
                                     else "查询完成：无占用"))
-            top.after(250, _poll)
+            run_in_background(top, _do, _done, interval=250)
 
         def _kill():
             sel = tree.selection()
@@ -8700,9 +9258,23 @@ class SpaceModule(BaseModule):
 
         tk.Button(btnf, text="🔍 查询", bg=PANEL2, fg=ORANGE, font=(FONT_UI, 9, "bold"),
                   bd=0, relief="flat", cursor="hand2", command=_query).pack(side="left")
+        def _paste_from_clipboard():
+            # clipboard_get 在剪贴板为空/只有图片时抛 TclError：旧实现直接
+            # 写进按钮回调，点一下就冒异常堆栈。
+            try:
+                txt = self.root.clipboard_get().strip()
+            except Exception:
+                show_info("剪贴板为空",
+                          "剪贴板里没有可读取的文本（图片/文件不算）。", parent=top)
+                return
+            if not txt:
+                show_info("剪贴板为空", "剪贴板里的文本是空的。", parent=top)
+                return
+            var.set(txt)
+
         tk.Button(btnf, text="📋 粘贴剪贴板路径", bg=PANEL2, fg=CYAN, font=(FONT_UI, 9),
                   bd=0, relief="flat", cursor="hand2",
-                  command=lambda: var.set(self.root.clipboard_get().strip())).pack(
+                  command=_paste_from_clipboard).pack(
             side="left", padx=(8, 0))
         tk.Button(btnf, text="❌ 结束选中进程", bg=PANEL2, fg=RED, font=(FONT_UI, 9),
                   bd=0, relief="flat", cursor="hand2", command=_kill).pack(
@@ -8731,9 +9303,9 @@ class SpaceModule(BaseModule):
         btnf.pack(side="bottom", fill="x", padx=16, pady=(2, 12))
         tree = ttk.Treeview(top, height=13, show="tree", selectmode="browse")
         tree.pack(fill="both", expand=True, padx=16, pady=(4, 4))
-        # 两个操作各用各的队列：共用一个队列时，UAC 期间连点两个按钮会让
-        # _poll 把「创建」的 (ok, msg) 当成「列出」的 (pts, total)，于是
-        # `for p in pts` 拿 bool 迭代直接 TypeError，整条轮询链断掉。
+        # 两个操作各自独立轮询：run_in_background 每次调用自带队列，
+        # 不再像旧实现那样共用一个 q —— UAC 期间连点两个按钮时，
+        # 「创建」的 (ok, msg) 会被「列出」当成 (pts, total) 解包。
         busy = {"v": False}
 
         def _list_points():
@@ -8741,20 +9313,10 @@ class SpaceModule(BaseModule):
                 return          # 上一次 UAC 还没结束，避免结果互相插队
             busy["v"] = True
             status.config(text="正在列出还原点…（会弹 UAC 确认）")
-            q = queue.Queue()
-            threading.Thread(target=lambda: q.put(list_restore_points()),
-                             daemon=True).start()
-            def _poll():
-                try:
-                    if not top.winfo_exists():
-                        return   # 对话框已关闭
-                except Exception:
-                    return
-                try:
-                    pts, total = q.get_nowait()
-                except queue.Empty:
-                    top.after(300, _poll)
-                    return
+            def _do(report):
+                report(list_restore_points())
+            def _done(message):
+                pts, total = message
                 busy["v"] = False
                 tree.delete(*tree.get_children())
                 if pts is None:
@@ -8765,7 +9327,7 @@ class SpaceModule(BaseModule):
                 for p in pts:
                     tree.insert("", "end", text="  🛡 " + p)
                 status.config(text=f"最近 {len(pts)} 条（系统共 {total} 个还原点）")
-            top.after(300, _poll)
+            run_in_background(top, _do, _done, interval=300)
 
         def _create():
             if busy["v"]:
@@ -8776,24 +9338,14 @@ class SpaceModule(BaseModule):
                 return
             busy["v"] = True
             status.config(text="正在创建还原点…（10~40 秒，请勿关闭）")
-            q = queue.Queue()
-            threading.Thread(target=lambda: q.put(create_restore_point("UnifiedToolbox")),
-                             daemon=True).start()
-            def _poll2():
-                try:
-                    if not top.winfo_exists():
-                        return   # 对话框已关闭
-                except Exception:
-                    return
-                try:
-                    ok, msg = q.get_nowait()
-                except queue.Empty:
-                    top.after(300, _poll2)
-                    return
+            def _do(report):
+                report(create_restore_point("UnifiedToolbox"))
+            def _done(message):
+                ok, msg = message
                 busy["v"] = False
                 (show_info if ok else show_warning)("系统还原点", msg, parent=top)
                 _list_points()
-            top.after(300, _poll2)
+            run_in_background(top, _do, _done, interval=300)
         tk.Button(btnf, text="🛡 创建还原点", bg=PANEL2, fg=GREEN, font=(FONT_UI, 9, "bold"),
                   bd=0, relief="flat", cursor="hand2", command=_create).pack(side="left")
         tk.Button(btnf, text="🔄 列出还原点", bg=PANEL2, fg=CYAN, font=(FONT_UI, 9),
@@ -8896,25 +9448,17 @@ class SoftwareModule(BaseModule):
             w.destroy()
         tk.Label(self._bloat_box, text="扫描注册表安装列表中…", bg=PANEL, fg=TEXT2,
                  font=(FONT_UI, 8)).pack(anchor="w")
-        q = queue.Queue()
-        def _do():
+        def _do(report):
             try:
                 apps = self._uninstall._all_apps or []
                 if not apps:
                     apps = self._uninstall._scan_reg()
-                q.put(("ok", match_oem_bloat(apps)))
+                report(("ok", match_oem_bloat(apps)))
             except Exception as e:
-                q.put(("err", str(e)))
-        threading.Thread(target=_do, daemon=True).start()
+                report(("err", str(e)))
 
-        def _poll():
-            if not self._view_live(token):
-                return
-            try:
-                typ, data = q.get_nowait()
-            except queue.Empty:
-                self.root.after(300, _poll)
-                return
+        def _done(message):
+            typ, data = message
             if typ == "err":
                 self._bloat_scan_btn.config(state="normal", text="扫描预装")
                 for w in self._bloat_box.winfo_children():
@@ -8923,7 +9467,8 @@ class SoftwareModule(BaseModule):
                          font=(FONT_UI, 8)).pack(anchor="w")
                 return
             self._render_bloat(data)
-        self.root.after(300, _poll)
+        run_in_background(self.root, _do, _done, interval=300,
+                          alive=lambda: self._view_live(token))
 
     def _render_bloat(self, found):
         self._bloat_scan_btn.config(state="normal", text="🔍 扫描预装")
@@ -8965,23 +9510,15 @@ class SoftwareModule(BaseModule):
     def _check_winget_async(self):
         token = self._view_token
         task = self._winget_check = object()
-        q = queue.Queue()
-        def work():
+        def work(report):
             try:
-                q.put(check_winget())
+                report(check_winget())
             except Exception:
-                q.put('')
-        def poll():
-            if not self._view_live(token) or self._winget_check is not task:
-                return
-            try:
-                version = q.get_nowait()
-            except queue.Empty:
-                self.root.after(300, poll)
-                return
+                report('')
+        def done(version):
             self._render_winget(version)
-        threading.Thread(target=work, daemon=True).start()
-        self.root.after(300, poll)
+        run_in_background(self.root, work, done, interval=300,
+                          alive=lambda: self._view_live(token) and self._winget_check is task)
 
     def _render_winget(self, v):
         self._wg_version = v
@@ -9020,10 +9557,9 @@ class SoftwareModule(BaseModule):
         token = self._view_token
         self._installing = True
         self._wg_go.config(state="disabled", text="⏳ 安装中…")
-        q = queue.Queue()
-        def _do():
+        def _do(report):
             for wid in ids:
-                q.put(("log", f"—— 安装 {wid} ——"))
+                report(("log", f"—— 安装 {wid} ——"))
                 try:
                     si = subprocess.STARTUPINFO()
                     si.dwFlags = subprocess.STARTF_USESHOWWINDOW
@@ -9035,34 +9571,26 @@ class SoftwareModule(BaseModule):
                         startupinfo=si, encoding="gbk", errors="ignore")
                     tail = [l for l in (r.stdout or "").splitlines() if l.strip()][-3:]
                     for l in tail:
-                        q.put(("log", "  " + l.strip()))
-                    q.put(("log", f"  {'✅ 完成' if r.returncode == 0 else '❌ 失败（码 %d）' % r.returncode}"))
+                        report(("log", "  " + l.strip()))
+                    report(("log", f"  {'✅ 完成' if r.returncode == 0 else '❌ 失败（码 %d）' % r.returncode}"))
                 except Exception as e:
-                    q.put(("log", f"  ❌ 异常：{e}"))
-            q.put(("done", None))
-        def _poll():
-            if getattr(self.app, "_closing", False):
-                return
+                    report(("log", f"  ❌ 异常：{e}"))
+            report(("done", None))
+        def _done(message):
+            typ, data = message
             live = self._view_live(token)
-            try:
-                while True:
-                    typ, data = q.get_nowait()
-                    if typ == "log":
-                        if live:
-                            self._wg_log_append(data)
-                    else:
-                        self._installing = False
-                        if self._view_live(self._view_token):
-                            self._render_winget(self._wg_version)
-                        if live:
-                            self._wg_log_append("—— 全部任务结束 ——")
-                        return
-            except queue.Empty:
-                pass
-            self.root.after(400, _poll)
+            if typ == "log":
+                if live:
+                    self._wg_log_append(data)
+                return
+            self._installing = False
+            if self._view_live(self._view_token):
+                self._render_winget(self._wg_version)
+            if live:
+                self._wg_log_append("—— 全部任务结束 ——")
         self._wg_log_append(f"开始安装 {len(ids)} 项（官方源，静默模式）…")
-        threading.Thread(target=_do, daemon=True).start()
-        self.root.after(400, _poll)
+        run_in_background(self.root, _do, _done, interval=400,
+                          alive=lambda: not getattr(self.app, "_closing", False))
 
     def _view_live(self, token):
         if getattr(self.app, '_closing', False):
@@ -9145,10 +9673,18 @@ class UtilityModule(BaseModule):
         self._mkbtn(now, "↻ 重启", lambda: self._power_now("restart"), YELLOW)
 
     def _power_schedule(self):
+        import math
         try:
             mins = float(self._mins_var.get())
-        except ValueError:
+            if not math.isfinite(mins):
+                raise ValueError
+        except (ValueError, OverflowError):
             show_warning("时间无效", "请填写分钟数（可含小数，如 1.5）")
+            return
+        # 后端只接受 10~86400 秒；提前在"分钟"这个单位上校验并给出可读提示
+        if not 0.5 <= mins <= 1440:
+            show_warning("时间超出范围", "请输入 0.5 ~ 1440 分钟之间的数值"
+                                        "（0.5 分钟 = 30 秒，1440 分钟 = 24 小时）")
             return
         secs = int(mins * 60)
         action = self._power_action.get()
@@ -9640,10 +10176,13 @@ class VerifyModule(BaseModule):
         [("Shift", "Shift_L"), ("Z", "z"), ("X", "x"), ("C", "c"), ("V", "v"),
          ("B", "b"), ("N", "n"), ("M", "m"), (",", "comma"), (".", "period"),
          ("/", "slash"), ("Shift", "Shift_R")],
-        [("Ctrl", "Control_L"), ("Win", "Win_L"), ("Alt", "Alt_L"),
-         ("──── 空格 ────", "space"), ("Alt", "Alt_R"), ("Fn", "Fn"),
+        [("Ctrl", "Control_L"), ("Win", "Super_L"), ("Alt", "Alt_L"),
+         ("──── 空格 ────", "space"), ("Alt", "Alt_R"), ("Win", "Super_R"),
          ("☰", "Menu"), ("Ctrl", "Control_R")],
     ]
+    # 部分键盘没有右 Win / Menu 键：仍然可以点亮，但不计入"全部通过"的分母。
+    # Fn 是硬件层按键，Tk 永远收不到 keysym，因此不出现在键位表里。
+    _KB_OPTIONAL = {"Super_R", "Menu"}
 
     def _keyboard_test(self):
         win = tk.Toplevel(self.root)
@@ -9658,7 +10197,10 @@ class VerifyModule(BaseModule):
         c = tk.Canvas(win, bg="#08090c", highlightthickness=0)
         c.pack(expand=True)
         rects = {}
-        KW, KH, GAP = 52, 46, 5
+        # 键宽按屏幕宽度自适应：固定 52px 在 4K 上只占左上角一小块
+        GAP = 5
+        KW = max(34, min(120, (self.root.winfo_screenwidth() - 40) // 15 - GAP))
+        KH = max(32, min(64, KW - 6))
         y = 8
         for row in self._KB_ROWS:
             x = 8
@@ -9672,7 +10214,6 @@ class VerifyModule(BaseModule):
                 rects[keysym] = (r, t, x, y, x + w, y + KH)
                 x += w + GAP
             y += KH + GAP
-        mrow = 3
         m_y = y + 12
         mouse = {}
         mx = 8
@@ -9683,10 +10224,9 @@ class VerifyModule(BaseModule):
             mouse[label] = (r, t)
             mx += 118
         hit = {"keys": set(), "total": 0}
-        keymap = {}
-        for row in self._KB_ROWS:
-            for label, keysym in row:
-                keymap[keysym] = keysym   # 直接以 keysym 为索引
+        # 分母不含"本机可能没有的键"（右 Win / Menu）：否则笔记本永远无法通过
+        required = sum(1 for ks in rects if ks not in self._KB_OPTIONAL)
+
         def _light(keysym, on):
             e = rects.get(keysym)
             if not e:
@@ -9701,10 +10241,11 @@ class VerifyModule(BaseModule):
             if ks in rects and ks not in hit["keys"]:
                 hit["keys"].add(ks)
             _light(ks, True)
-            tested = sum(1 for ks in rects if ks in hit["keys"])
-            status.config(text=f"已测按键 {tested}/{len(rects)} · 累计 {hit['total']} 次 · "
+            tested = sum(1 for ks in rects
+                         if ks in hit["keys"] and ks not in self._KB_OPTIONAL)
+            status.config(text=f"已测按键 {tested}/{required} · 累计 {hit['total']} 次 · "
                                "全部点亮即通过 · Esc=退出",
-                          fg=GREEN if tested >= len(rects) else TEXT2)
+                          fg=GREEN if tested >= required else TEXT2)
         def _release(e):
             _light(e.keysym, False)
         def _mb(e, label):
@@ -9720,8 +10261,9 @@ class VerifyModule(BaseModule):
         win.bind("<Button-2>", lambda e: _mb(e, "鼠标中键"))
         win.bind("<MouseWheel>", lambda e: _mb(e, "滚轮↑" if e.delta > 0 else "滚轮↓"))
         def _close(_e=None):
-            tested = sum(1 for ks in rects if ks in hit["keys"])
-            self._hw_results["keyboard"] = (tested, len(rects))
+            tested = sum(1 for ks in rects
+                         if ks in hit["keys"] and ks not in self._KB_OPTIONAL)
+            self._hw_results["keyboard"] = (tested, required)
             self._touch_hw_status()
             win.destroy()
         win.protocol("WM_DELETE_WINDOW", _close)
@@ -9754,23 +10296,11 @@ class VerifyModule(BaseModule):
         tree.heading("状态", text="状态")
         vs.pack(side="right", fill="y")
         tree.pack(side="left", fill="both", expand=True)
-        q = queue.Queue()
-        def _do():
-            q.put(scan_driver_issues())
-        threading.Thread(target=_do, daemon=True).start()
+        def _do(report):
+            report(scan_driver_issues())
         result = {}
-        def _poll():
-            try:
-                if not top.winfo_exists():
-                    return   # 对话框已关闭
-            except Exception:
-                return
-            try:
-                result["data"] = q.get_nowait()
-            except queue.Empty:
-                top.after(300, _poll)
-                return
-            d = result["data"]
+        def _done(d):
+            result["data"] = d
             self._hw_results["driver"] = list(d["problems"])
             self._touch_hw_status()
             tree.delete(*tree.get_children())
@@ -9791,7 +10321,7 @@ class VerifyModule(BaseModule):
         tree.tag_configure("ok", foreground=GREEN)
         tree.tag_configure("warn", foreground=RED, font=(FONT_UI, 10, "bold"))
         tree.tag_configure("warn2", foreground=ORANGE)
-        top.after(300, _poll)
+        run_in_background(top, _do, _done, interval=300)
         def _export():
             d = result.get("data") or {"problems": [], "gpus": []}
             lines = [f"驱动健康检查  {datetime.datetime.now().strftime('%Y-%m-%d %H:%M')}",
@@ -9845,9 +10375,15 @@ class App:
         self._event_timer = root.after(50, self._drain_ui_events)
         root.title(f"{APP_NAME} {APP_VERSION}")
         root.configure(bg=BG)
+        _ico = _app_icon_path()
+        if _ico:
+            try: root.iconbitmap(default=_ico)   # 任务栏/Alt-Tab 用回工具箱图标
+            except Exception: pass
         self._setup_ttk_style()
+        # DPI 感知已在 main() 创建 Tk 之前设置；这里保留兜底（源码里直接
+        # 构造 App(root) 的调用方仍能得到 system-aware 行为）。
         try: ctypes.windll.shcore.SetProcessDpiAwareness(1)
-        except: pass
+        except Exception: pass
 
         # 懒加载模块：启动只建页签（读类属性），页面实例在首次切换时才创建
         self._module_classes = {cls.name: cls for cls in MODULES}
@@ -9859,7 +10395,9 @@ class App:
         # 恢复上次窗口大小/位置（无保存记录则用默认）
         saved_geo = SETTINGS.get("geometry", "")
         root.geometry(self._validated_geometry(saved_geo))
-        root.minsize(1100, 500)
+        # 最小尺寸不能硬编码 1100：1366×768 在 125% 缩放下逻辑宽度只有约
+        # 1093，强制 1100 会把窗口撑出屏幕、右侧按钮/页签被裁掉。
+        self._fit_min_size()
         # 窗口状态复原：要么用户勾了"启动时最大化"，要么上次退出时就是最大化的。
         # 旧版完全没有这段：_save_geometry 在最大化时直接 return，既不记录用户
         # 想要最大化，也不复原，于是每次启动都回到那个小尺寸 —— 就是"开起来只有半屏"。
@@ -9967,7 +10505,7 @@ class App:
         style.configure(".", background=BG, foreground=TEXT, borderwidth=0)
         style.configure("Treeview", background=PANEL, foreground=TEXT,
                         borderwidth=0, fieldbackground=PANEL,
-                        rowheight=30, font=(FONT_MONO, 9))
+                        rowheight=30, font=(FONT_UI, 9))
         style.configure("Treeview.Heading", background=PANEL3, foreground=CYAN,
                         borderwidth=0, relief="flat",
                         font=(FONT_UI, 9, "bold"), padding=(8, 6))
@@ -9988,10 +10526,32 @@ class App:
         style.configure("Frame", background=BG)
 
     def _apply_theme_live(self, name):
-        """实时切换主题：改写全局色值 → 重刷 ttk → 重绘顶部骨架 → 重建当前页。"""
+        """实时切换主题：改写全局色值 → 重刷 ttk → 就地重着色整棵控件树。
+
+        不再销毁重建当前页：重建会中断正在跑的扫描/安装，还会清空搜索框、
+        列表数据和滚动位置（软件页甚至会触发一次全量重扫）。也不能关掉
+        设置窗口重开——那会把用户正在改的选项一起丢掉。
+        """
+        old = ACTIVE_PALETTE
         apply_theme(name)
         self._setup_ttk_style()
         r = self.root
+        # 先按"旧色值→新色值"把现有控件刷一遍，再补顶部骨架等语义色。
+        # 顺序不能反：先设新色再重着色，会把"新 CYAN 恰好等于旧 GREEN"
+        # 这类跨主题撞色误改成别的角色。
+        try:
+            recolor_widget_tree(r, _theme_color_map(old.as_dict(),
+                                                    ACTIVE_PALETTE.as_dict()))
+        except Exception:
+            # 极端情况下失败（异常控件/自定义颜色）→ 退回重建，
+            # 宁可丢一次页面状态，也不能留下半套配色。
+            self._switch(self.current.name)
+            sw = getattr(self, "_settings_win", None)
+            if sw is not None and sw.winfo_exists():
+                sw.destroy()
+                self._settings_win = None
+                r.after(60, self.show_settings)
+            return
         r.configure(bg=BG)
         self.tab_frame.config(bg=PANEL)
         for n, btn in self.tab_btns.items():
@@ -10013,14 +10573,23 @@ class App:
         if getattr(self, "_tab_ind", None) is not None:
             self._tab_ind.config(bg=CYAN)
         enable_dark_title_bar(r)
-        # 重建当前页（所有控件在创建时读取色值）
-        self._switch(self.current.name)
-        # 设置窗口若开着，关掉重开以套用新配色
-        sw = getattr(self, "_settings_win", None)
-        if sw is not None and sw.winfo_exists():
-            sw.destroy()
-            self._settings_win = None
-            r.after(60, self.show_settings)
+        # 设置中心的主题预览块用各自调色板重涂：否则"当前主题"那一块会被
+        # 旧→新映射染成新主题，看起来像两个一模一样的色块。
+        for tkey, swatch, dot, sel in getattr(self, "_theme_chips", ()):
+            tdef = THEMES.get(tkey)
+            if not tdef:
+                continue
+            try:
+                _paint_theme_chip(tdef, swatch, dot, sel)
+            except Exception:
+                continue
+        # 已存在的 Toplevel（设置/快速面板等）标题栏跟随明暗主题
+        for w in r.winfo_children():
+            if isinstance(w, tk.Toplevel):
+                try:
+                    enable_dark_title_bar(w)
+                except Exception:
+                    pass
 
     def _save_geometry(self):
         """记住窗口大小/位置，以及当时是否最大化。
@@ -10404,7 +10973,7 @@ class App:
         sc = self._strip
         sc.delete("all")
         w = sc.winfo_width()
-        c1, c2 = THEMES.get(THEME_NAME, THEMES["blue"])["STRIP"]
+        c1, c2 = (THEMES.get(THEME_NAME) or THEMES["blue"]).STRIP
         r1, g1, b1 = int(c1[1:3], 16), int(c1[3:5], 16), int(c1[5:7], 16)
         r2, g2, b2 = int(c2[1:3], 16), int(c2[3:5], 16), int(c2[5:7], 16)
         seg = 16  # 每16px一段渐变，视觉上平滑
@@ -10420,10 +10989,14 @@ class App:
     # ─── 在线更新（只在手动点「检查更新」时联网，不做后台静默请求）───
     def check_update(self, repo=None):
         """查最新 Release → 比对版本 → 询问 → 下载 → 退出后自替换并重启。"""
+        if getattr(self, "_update_checking", False):
+            return          # 已有检查窗口开着：连点不该开出多个并发请求
+        self._update_checking = True
         repo = (repo if repo is not None else SETTINGS.get("update_repo", "")) \
             or UPDATE_REPO_DEFAULT
         repo = repo.strip()
         if not repo or "/" not in repo:
+            self._update_checking = False
             show_info("未配置更新源",
                       "请先在上面的「更新源」里填 owner/repo，例如 myname/toolbox。\n\n"
                       "并确认该仓库已发布 Release，且把 exe 作为附件上传。",
@@ -10435,6 +11008,13 @@ class App:
         win.resizable(False, False)
         win.transient(self.root)
         enable_dark_title_bar(win)
+        def _abort_check():
+            self._update_checking = False
+            try: win.destroy()
+            except Exception: pass
+        win.protocol("WM_DELETE_WINDOW", _abort_check)
+        try: win.grab_set()
+        except Exception: pass
         tk.Label(win, text=f"正在检查 {repo} …", bg=BG, fg=TEXT2,
                  font=(FONT_UI, 9)).pack(padx=26, pady=(20, 8))
         bar = ttk.Progressbar(win, mode="indeterminate", length=320)
@@ -10443,23 +11023,22 @@ class App:
         win.update_idletasks()
         _center_on(win, self.root)
 
-        q = queue.Queue()
-        threading.Thread(target=lambda: q.put(fetch_latest_release(repo)),
-                         daemon=True).start()
+        # 把校验哈希和查询结果一起带过线程边界：只放在模块全局里会被并发的
+        # 另一次查询覆盖，导致拿 A 版本的哈希校验 B 版本的包。
+        def _query(report):
+            try:
+                report((fetch_latest_release(repo), _LAST_RELEASE_SHA))
+            except Exception as e:
+                report(((None, None, None, "网络错误：%s" % e), ""))
 
-        def _poll():
-            try:
-                if not win.winfo_exists():
-                    return
-            except Exception:
+        def _done(message):
+            if not win.winfo_exists():
+                self._update_checking = False
                 return
-            try:
-                tag, url, name, err = q.get_nowait()
-            except queue.Empty:
-                win.after(200, _poll)
-                return
+            (tag, url, name, err), sha = message
             bar.stop()
             win.destroy()
+            self._update_checking = False
             if err:
                 show_warning("检查更新失败", err, parent=self.root)
                 return
@@ -10483,23 +11062,49 @@ class App:
                              "替换自身并重新启动。",
                              parent=self.root):
                 return
-            self._download_update(url, name)
-        win.after(200, _poll)
+            self._download_update(url, name, sha)
+        run_in_background(win, _query, _done, interval=200)
 
-    def _download_update(self, url, name):
+    def _download_update(self, url, name, expect_sha=""):
         """下载更新包，然后交给批处理在退出后替换 exe 并重启。"""
-        dest = Path(tempfile.gettempdir()) / (name or "unified_toolbox_new.exe")
+        if getattr(self, "_updating", False):
+            show_info("更新中", "已有更新任务在进行，请稍候", parent=self.root)
+            return
+        self._updating = True
+        # Release 附件名不可信：去掉路径分量，防止 ..\ 或绝对路径把文件写到
+        # 临时目录之外（随后还会被执行）。固定落在独立临时目录里。
+        safe_name = Path(str(name or "")).name.strip() or "unified_toolbox_new.exe"
+        if not safe_name.lower().endswith(".exe"):
+            safe_name += ".exe"
+        dest = Path(tempfile.mkdtemp(prefix="utb_update_")) / safe_name
+
         win = tk.Toplevel(self.root)
         win.title("下载更新")
         win.configure(bg=BG)
         win.resizable(False, False)
         win.transient(self.root)
-        win.protocol("WM_DELETE_WINDOW", lambda: None)   # 下载中不允许关掉
         enable_dark_title_bar(win)
         status = tk.Label(win, text="正在下载…", bg=BG, fg=TEXT2, font=(FONT_UI, 9))
         status.pack(padx=26, pady=(20, 8))
         bar = ttk.Progressbar(win, mode="determinate", length=320, maximum=100)
-        bar.pack(padx=26, pady=(0, 18))
+        bar.pack(padx=26, pady=(0, 10))
+        cancel_evt = threading.Event()
+
+        def _close():
+            cancel_evt.set()
+
+        def _cancel():
+            cancel_evt.set()
+            status.config(text="正在取消…", fg=ORANGE)
+            cancel_btn.config(state="disabled")
+
+        cancel_btn = tk.Button(win, text="取消", bg=PANEL2, fg=TEXT2,
+                               font=(FONT_UI, 9), bd=0, relief="flat",
+                               cursor="hand2", command=_cancel)
+        cancel_btn.pack(pady=(0, 14))
+        win.protocol("WM_DELETE_WINDOW", _close)
+        try: win.grab_set()
+        except Exception: pass
         win.update_idletasks()
         _center_on(win, self.root)
 
@@ -10508,15 +11113,28 @@ class App:
 
         def _work():
             box["err"] = download_update(
-                url, dest, progress=lambda d, t: prog.update(done=d, total=t))
+                url, dest, progress=lambda d, t: prog.update(done=d, total=t),
+                cancel=cancel_evt, expect_sha=expect_sha)
 
         threading.Thread(target=_work, daemon=True).start()
+
+        def _finish():
+            self._updating = False
+            try:
+                win.grab_release()
+                win.destroy()
+            except Exception:
+                pass
 
         def _poll():
             try:
                 if not win.winfo_exists():
+                    self._updating = False
+                    cancel_evt.set()      # 窗口丢了也别让后台线程继续下载
                     return
             except Exception:
+                self._updating = False
+                cancel_evt.set()
                 return
             if "err" not in box:
                 done, total = prog["done"], prog["total"]
@@ -10528,10 +11146,14 @@ class App:
                     status.config(text=f"正在下载… {done/1024/1024:.1f} MB")
                 win.after(150, _poll)
                 return
-            win.destroy()
             err = box["err"]
+            _finish()
             if err:
-                show_error("更新失败", err, parent=self.root)
+                if cancel_evt.is_set() and err == "已取消下载":
+                    show_info("已取消", "更新包未下载完成，当前版本保持不变。",
+                              parent=self.root)
+                else:
+                    show_error("更新失败", err, parent=self.root)
                 return
             self._apply_update(dest)
         win.after(150, _poll)
@@ -10592,34 +11214,38 @@ class App:
         # ── 主题风格（点选即时预览，保存持久化，取消还原） ──
         section("◈ 主题风格")
         f0 = card()
-        # 「取消」要还原到"打开设置中心时"的主题。切换主题会销毁并重建本窗口
-        # （_apply_theme_live），所以原主题必须挂在 App 上跨重建保存；否则新窗口的
-        # THEME_NAME 已经等于刚才预览的主题，二者恒相等，取消就成了空操作（旧版 bug）。
+        # 「取消」要还原到"打开设置中心时"的主题。预览会立刻改全局配色，
+        # 所以原主题必须挂在 App 上、不能只存在本窗口闭包里：关掉再开时仍要
+        # 能回到用户最初的主题，而不是把上一次的预览当成"原主题"。
         saved_theme = getattr(self, "_settings_theme_at_open", None) or THEME_NAME
         self._settings_theme_at_open = saved_theme
         theme_var = tk.StringVar(value=THEME_NAME)
         theme_grid = tk.Frame(f0, bg=PANEL)
         theme_grid.pack(fill="x", padx=12, pady=(6, 4))
-        for i, (tkey, tdef) in enumerate(THEMES.items()):
-            r, c = divmod(i, 2)
-            chip_bg = tdef["BG"] if tdef["dark"] else tdef["PANEL2"]
-            swatch = tk.Frame(theme_grid, bg=chip_bg, highlightthickness=1,
-                              highlightbackground=tdef["BORDER"])
+        self._theme_chips = []      # [(key, swatch, dot, radio)]，主题切换/导入时重涂
+
+        def add_chip(tkey, tdef):
+            """追加一个主题预览块（导入自定义配色时要现场加一个）。"""
+            r, c = divmod(len(self._theme_chips), 2)
+            swatch = tk.Frame(theme_grid, bg=PANEL, highlightthickness=1,
+                              highlightbackground=BORDER)
             swatch.grid(row=r, column=c, padx=(0, 8), pady=3, sticky="nsew")
             theme_grid.grid_columnconfigure((0, 1), weight=1)
-            dot = tk.Label(swatch, text="●", bg=chip_bg, fg=tdef["CYAN"],
-                           font=(FONT_UI, 9))
+            dot = tk.Label(swatch, text="●", bg=PANEL, fg=CYAN, font=(FONT_UI, 9))
             dot.pack(side="left", padx=(8, 3), pady=7)
-            sel = tk.Radiobutton(swatch, text=tdef["label"], value=tkey,
+            sel = tk.Radiobutton(swatch, text=tdef.label, value=tkey,
                                  variable=theme_var,
-                                 bg=chip_bg, fg=tdef["TEXT"], selectcolor=tdef["BG"],
-                                 activebackground=chip_bg, activeforeground=tdef["CYAN"],
                                  font=(FONT_UI, 9), bd=0, highlightthickness=0,
                                  cursor="hand2",
                                  command=lambda k=tkey: self._apply_theme_live(k))
             sel.pack(side="left")
             for w in (swatch, dot):
                 w.bind("<Double-1>", lambda e, k=tkey: self._apply_theme_live(k))
+            _paint_theme_chip(tdef, swatch, dot, sel)
+            self._theme_chips.append((tkey, swatch, dot, sel))
+
+        for _tkey, _tdef in THEMES.items():
+            add_chip(_tkey, _tdef)
         tk.Label(f0, text="点选即时预览整窗换肤；「保存」长期生效，「取消」还原原主题",
                  bg=PANEL, fg=TEXT2, font=(FONT_UI, 8)).pack(anchor="w", padx=12, pady=(0, 8))
         # 自定义配色导入/导出
@@ -10634,8 +11260,7 @@ class App:
             if not path:
                 return
             try:
-                data = dict(THEMES[theme_var.get()] if theme_var.get() in THEMES
-                            else THEMES[THEME_NAME])
+                data = (THEMES.get(theme_var.get()) or THEMES[THEME_NAME]).as_dict()
                 Path(path).write_text(json.dumps(data, ensure_ascii=False, indent=1),
                                       encoding="utf-8")
                 show_info("已导出", f"当前配色已导出到：\n{path}", parent=win)
@@ -10650,22 +11275,28 @@ class App:
                 return
             try:
                 data = json.loads(Path(path).read_text(encoding="utf-8"))
-                if not isinstance(data, dict) or any(k not in data for k in _THEME_KEYS):
-                    raise ValueError("缺少必要配色字段")
-                data["dark"] = bool(data.get("dark", True))
-                data.setdefault("label", "🎨 自定义")
-                data.setdefault("STRIP", (data["CYAN"], data["BORDER"]))
-                THEMES["custom"] = {k: data[k] for k in
-                                    list(_THEME_KEYS) + ["dark", "label", "STRIP"] if k in data}
+                THEMES["custom"] = Palette.from_mapping(data)
                 custom_file = Path.home() / ".unified_toolbox_theme_custom.json"
-                custom_file.write_text(json.dumps(THEMES["custom"], ensure_ascii=False, indent=1),
-                                       encoding="utf-8")
+                custom_file.write_text(
+                    json.dumps(THEMES["custom"].as_dict(), ensure_ascii=False, indent=1),
+                    encoding="utf-8")
             except Exception as e:
                 show_error("导入失败", f"配色文件无效：\n{e}", parent=win)
                 return
-            self._apply_theme_live("custom")
             theme_var.set("custom")
             show_info("已导入", "自定义配色已应用，「保存」后长期生效", parent=win)
+            # show_info 是模态的（wait_window 阻塞到关闭），返回时设置窗口仍存活。
+            # 现在就地套用配色（不会销毁窗口，所以顺序其实已不敏感，但保持
+            # "先提示、后换色"能避免提示框本身跟着变色）。
+            self._apply_theme_live("custom")
+            # 窗口不再重建，自定义色块要现场补进网格；已存在则只更新它的配色
+            keys = [c[0] for c in getattr(self, "_theme_chips", ())]
+            if "custom" in keys:
+                for tkey, swatch, dot, sel in self._theme_chips:
+                    if tkey == "custom":
+                        _paint_theme_chip(THEMES["custom"], swatch, dot, sel)
+            else:
+                add_chip("custom", THEMES["custom"])
 
         tk.Button(te_row, text="⬆ 导出当前配色", bg=PANEL2, fg=TEXT2, font=(FONT_UI, 8),
                   bd=0, relief="flat", cursor="hand2", command=export_theme).pack(side="left")
@@ -10854,14 +11485,17 @@ class App:
             self._settings_theme_at_open = None
             if not err:
                 win.destroy()
-                show_info(T("已保存"), T("设置已保存并即时生效"))
+                # 指定 parent：旧代码不传 parent，弹窗会挂到 _default_root 上，
+                # 可能出现在主窗口后面/屏幕正中，与其它弹窗行为不一致
+                show_info(T("已保存"), T("设置已保存并即时生效"), parent=self.root)
         def cancel():
-            # 还原为打开设置中心时的主题（预览未保存的切换作废）
+            # 还原为打开设置中心时的主题（预览未保存的切换作废），然后关窗。
+            # 先改单选框再换色：换色是就地重涂，不会重建窗口，所以不能像旧版
+            # 那样 return 等重建（否则窗口会留在屏幕上）。
             self._settings_theme_at_open = None
             if theme_var.get() != saved_theme:
-                self._apply_theme_live(saved_theme)
                 theme_var.set(saved_theme)
-                return          # _apply_theme_live 会重建本窗口，别再 destroy 旧窗口
+                self._apply_theme_live(saved_theme)
             win.destroy()
         tk.Button(btns, text="✔ " + T("保存"), bg=CYAN, fg=BG, font=(FONT_UI, 10, "bold"),
                   bd=0, relief="flat", cursor="hand2", padx=18, pady=3,
@@ -11037,6 +11671,16 @@ class App:
                 return
         self._event_timer = self.root.after(50, self._drain_ui_events)
 
+    def _fit_min_size(self):
+        """按当前屏幕逻辑尺寸设置最小窗口：绝不能大于可用桌面。"""
+        try:
+            sw = self.root.winfo_screenwidth()
+            sh = self.root.winfo_screenheight()
+        except Exception:
+            sw, sh = 1280, 720
+        self.root.minsize(min(1100, max(760, sw - 40)),
+                          min(500, max(420, sh - 80)))
+
     def _validated_geometry(self, value):
         # Validate syntax and constrain to the current virtual desktop.
         match = re.fullmatch(r'(\d{2,5})x(\d{2,5})(?:([+-]\d{1,6})([+-]\d{1,6}))?',
@@ -11050,7 +11694,8 @@ class App:
             left, top = 0, 0
             sw, sh = self.root.winfo_screenwidth(), self.root.winfo_screenheight()
         w, h = (int(match[1]), int(match[2])) if match else (1100, 900)
-        w, h = max(1100, min(w, sw)), max(500, min(h, sh))
+        # 下限不能超过桌面尺寸（旧版 max(1100, ...) 在窄屏上会把窗口撑出屏幕）
+        w, h = min(max(900, w), sw), min(max(500, h), sh)
         x, y = (int(match[3] or left), int(match[4] or top)) if match else (left, top)
         x = min(max(x, left), max(left, left + sw - w))
         y = min(max(y, top), max(top, top + sh - h))
@@ -11077,8 +11722,40 @@ class App:
             return None
 
 
-
 _SINGLETON_MUTEX = None   # 单实例锁句柄：进程存活期间必须持有
+
+
+def _app_icon_path():
+    """窗口图标 .ico 的绝对路径（源码运行 / PyInstaller 单文件都适用）。"""
+    base = getattr(sys, "_MEIPASS", None) or os.path.dirname(os.path.abspath(__file__))
+    # 打包时 datas 落在 _MEIPASS/icons；源码运行时 ico 在仓库根的 icons/，
+    # 而 __file__ 在 unified/ 下，所以两处都要找。
+    for root in (base, os.path.dirname(base)):
+        for rel in ("icons/doctor.ico", "doctor.ico"):
+            p = os.path.join(root, rel)
+            if os.path.exists(p):
+                return p
+    return ""
+
+
+def _enable_dpi_awareness():
+    """必须在创建 tk.Tk() 之前调用。
+
+    默认 system-aware(1)：高分屏上文字清晰，且不会因为跨屏缩放变化导致
+    Tk 布局不重排（像素布局的应用不适合贸然上 Per-Monitor V2）。
+    需要逐显示器 V2 的可设 UTB_DPI=2（调用方需自行处理 WM_DPICHANGED）。
+    """
+    if os.environ.get("UTB_DPI") == "2":
+        try:
+            if ctypes.windll.user32.SetProcessDpiAwarenessContext(-4):
+                return
+        except Exception:
+            pass
+    try:
+        ctypes.windll.shcore.SetProcessDpiAwareness(1)
+    except Exception:
+        try: ctypes.windll.user32.SetProcessDPIAware()
+        except Exception: pass
 
 
 def main():
@@ -11098,41 +11775,63 @@ def main():
     # （explorer.exe 拉起时无法传参，只能靠标记文件传话）
     after_update = "--after-update" in sys.argv[1:] or consume_update_flag()
     # 单实例锁：防止两个实例同时写剪贴板历史/设置互相覆盖。
-    # 必须用 use_last_error=True 的 WinDLL 读错误码——ctypes 普通调用会干扰 last-error。
+    # 只用 CreateMutexW + ERROR_ALREADY_EXISTS 判定：旧写法先 OpenMutex 探测、
+    # 再 CreateMutex，两个实例同时启动时会双双通过（TOCTOU 竞态）。
     kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
     kernel32.CreateMutexW.restype = ctypes.c_void_p
     kernel32.CreateMutexW.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_wchar_p]
-    global _SINGLETON_MUTEX
-    kernel32.OpenMutexW.restype = ctypes.c_void_p
-    kernel32.OpenMutexW.argtypes = [ctypes.c_uint, ctypes.c_int, ctypes.c_wchar_p]
-    kernel32.CreateMutexW.restype = ctypes.c_void_p
-    kernel32.CreateMutexW.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_wchar_p]
     kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
-    # 用 OpenMutexW 探测是否已有实例：不依赖 last-error（ctypes 场景下不可靠）
+    global _SINGLETON_MUTEX
     # 名字可用 UTB_MUTEX_NAME 覆盖（便于自动化测试或多配置并行）
     mutex_name = os.environ.get("UTB_MUTEX_NAME") or "Local\\统一工具箱.Singleton"
-    existing = kernel32.OpenMutexW(0x00100000, 0, mutex_name)
-    if existing:
-        kernel32.CloseHandle(existing)
-        freed = False
-        if after_update:
-            for _ in range(20):          # 最多等 10 秒
-                time.sleep(0.5)
-                existing = kernel32.OpenMutexW(0x00100000, 0, mutex_name)
-                if not existing:
-                    freed = True
-                    break
-                kernel32.CloseHandle(existing)
-        if not freed:
-            ctypes.windll.user32.MessageBoxW(
-                None, "统一工具箱 已经在运行（请检查系统托盘）。",
-                "统一工具箱 已在运行", 0x00000040)
-            return
-    _SINGLETON_MUTEX = kernel32.CreateMutexW(None, 0, mutex_name)
+    ERROR_ALREADY_EXISTS = 183
+
+    def _acquire_mutex():
+        """返回 (句柄, 是否已有实例)。创建失败时放行，避免程序打不开。"""
+        h = kernel32.CreateMutexW(None, 0, mutex_name)
+        if not h:
+            return None, False
+        return h, ctypes.get_last_error() == ERROR_ALREADY_EXISTS
+
+    _SINGLETON_MUTEX, already = _acquire_mutex()
+    if already and after_update:
+        # 自更新重启：旧实例刚退，互斥体释放可能晚于进程消失，最多等 10 秒
+        for _ in range(20):
+            if _SINGLETON_MUTEX:
+                kernel32.CloseHandle(_SINGLETON_MUTEX)
+                _SINGLETON_MUTEX = None
+            time.sleep(0.5)
+            _SINGLETON_MUTEX, already = _acquire_mutex()
+            if not already:
+                break
+    if already:
+        if _SINGLETON_MUTEX:
+            kernel32.CloseHandle(_SINGLETON_MUTEX)
+            _SINGLETON_MUTEX = None
+        ctypes.windll.user32.MessageBoxW(
+            None, "统一工具箱 已经在运行（请检查系统托盘）。",
+            "统一工具箱 已在运行", 0x00000040)
+        return
+    _enable_dpi_awareness()   # 必须在 tk.Tk() 之前：晚设置等于没设置
     root = tk.Tk()
-    root.geometry("1100x900")
-    root.minsize(1100, 500)
+    # 默认尺寸按屏幕收窄：1024×768 / 1366×768@125% 上 1100×900 会超出桌面
+    sw, sh = root.winfo_screenwidth(), root.winfo_screenheight()
+    root.geometry(f"{min(1100, max(760, sw - 60))}x{min(900, max(560, sh - 80))}")
     App(root)
+    # 更新后首次启动：窗口真正建好 3 秒后再认领"成功"，给替换脚本吃定心丸。
+    # 起不来（导入错误/缺 DLL/被杀软拦）就不会有标记，脚本会自动回滚。
+    if after_update:
+        root.after(3000, mark_update_ok)
+    else:
+        # 正常启动：清掉上次可能残留的 .old/.new（等窗口稳定再动文件）
+        root.after(60000, cleanup_stale_update_files)
+    # 上一次更新失败/回滚过：提示一次（同时删除记录）
+    _update_error = take_update_error()
+    if _update_error:
+        root.after(1200, lambda: show_warning(
+            "上次更新未完成",
+            _update_error + "\n\n已自动恢复到当前版本，可直接继续使用。",
+            parent=root))
     root.mainloop()
 
 

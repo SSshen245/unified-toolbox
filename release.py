@@ -162,6 +162,9 @@ def publish_to_gitee(tag, exe, say):
         made_copy = not ascii_exe.exists()
         if made_copy:
             shutil.copy2(exe, ascii_exe)
+        sha_path = ascii_exe.with_name(GH_ASSET_NAME + ".sha256")
+        digest = hashlib.sha256(ascii_exe.read_bytes()).hexdigest()
+        sha_path.write_text(f"{digest}  {GH_ASSET_NAME}\n", encoding="ascii")
         try:
             rel = None
             try:
@@ -172,7 +175,8 @@ def publish_to_gitee(tag, exe, say):
                 rel = call("/releases", method="POST", data={
                     "tag_name": tag,
                     "name": f"统一工具箱 {tag}",
-                    "body": f"同步自 GitHub Release {tag}。更新说明见同名 GitHub Release。",
+                    "body": (f"同步自 GitHub Release {tag}。"
+                             f"更新说明见同名 GitHub Release。\n\nSHA256: {digest}"),
                     # tag 还没同步到 Gitee 时，指明在默认分支上建 tag；
                     # 缺这个参数对不存在的 tag 会返回 400
                     "target_commitish": "main",
@@ -180,11 +184,13 @@ def publish_to_gitee(tag, exe, say):
                 say(f"      Gitee：已创建发行版 {tag}")
             rel_id = rel["id"]
             call(f"/releases/{rel_id}/attach_files", file_path=ascii_exe, method="POST")
+            call(f"/releases/{rel_id}/attach_files", file_path=sha_path, method="POST")
             say(f"      Gitee：附件已上传 → https://gitee.com/{slug}/releases/tag/{tag}")
             return True
         finally:
             if made_copy:
                 ascii_exe.unlink(missing_ok=True)
+            sha_path.unlink(missing_ok=True)
     except Exception as e:
         say(f"      Gitee 同步失败（不影响 GitHub 发布）:{e}")
         return False
@@ -282,18 +288,24 @@ def publish_to_github(tag, exe, notes_path, say):
 
     # 用 ASCII 名的副本上传（本地文件名保持中文不动）
     ascii_exe = exe.with_name(GH_ASSET_NAME)
+    sha_path = ascii_exe.with_name(GH_ASSET_NAME + ".sha256")
     try:
         shutil.copy2(exe, ascii_exe)
+        # 更新校验文件：客户端下载后会比对，防止 CDN 劫持/半包/错版本
+        digest = hashlib.sha256(ascii_exe.read_bytes()).hexdigest()
+        sha_path.write_text(f"{digest}  {GH_ASSET_NAME}\n", encoding="ascii")
+        say(f"      SHA256 {digest}")
     except Exception as e:
         say(f"      跳过：准备附件失败 {e}")
         return False
+    files = [str(ascii_exe), str(sha_path)]
     try:
         exists = subprocess.run([gh, "release", "view", tag], env=env,
                                 capture_output=True, text=True).returncode == 0
         if exists:
-            cmd = [gh, "release", "upload", tag, str(ascii_exe), "--clobber"]
+            cmd = [gh, "release", "upload", tag, *files, "--clobber"]
         else:
-            cmd = [gh, "release", "create", tag, str(ascii_exe),
+            cmd = [gh, "release", "create", tag, *files,
                    "--title", tag, "--target", "main", "--generate-notes"]
             if notes_path and Path(notes_path).exists():
                 cmd += ["--notes-file", str(notes_path)]
@@ -306,6 +318,7 @@ def publish_to_github(tag, exe, notes_path, say):
         return True
     finally:
         ascii_exe.unlink(missing_ok=True)
+        sha_path.unlink(missing_ok=True)
 
 
 def read_version():
